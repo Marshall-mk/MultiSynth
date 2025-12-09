@@ -28,6 +28,7 @@ from typing import List, Dict, Tuple, Optional, Union
 from .encoder import ConvEncoder, MultiModalEncoder
 from .decoder import ConvDecoder, MultiOutputDecoder
 from .fusion import ProductOfGaussians, GaussianSampler, MultiScaleFusion
+from .utils import PixelShuffle3d
 
 
 class UHVED(nn.Module):
@@ -57,7 +58,7 @@ class UHVED(nn.Module):
         share_decoder: bool = False,
         use_prior: bool = True,
         activation: str = 'leakyrelu',
-        upsample_mode: str = 'bilinear',
+        upsample_mode: str = 'trilinear',
         reconstruct_modalities: bool = True
     ):
         """
@@ -199,7 +200,7 @@ class UHVED(nn.Module):
         Full forward pass.
 
         Args:
-            modalities: List of input tensors (B, C, H, W) per modality
+            modalities: List of input tensors (B, C, D, H, W) per modality
             modality_mask: Boolean tensor indicating which modalities are present
             deterministic: If True, use mean instead of sampling
 
@@ -365,19 +366,19 @@ class UHVEDWithUpscale(nn.Module):
         out_channels: int,
         scale: int
     ) -> nn.Module:
-        """Build pixel-shuffle upscaler."""
+        """Build pixel-shuffle 3D upscaler."""
         layers = []
         remaining = scale
 
         while remaining > 1:
             layers.extend([
-                nn.Conv2d(in_channels, in_channels * 4, 3, 1, 1),
-                nn.PixelShuffle(2),
+                nn.Conv3d(in_channels, in_channels * 8, 3, 1, 1),  # 8 = 2^3 for 3D
+                PixelShuffle3d(2),
                 nn.LeakyReLU(0.2, inplace=True)
             ])
             remaining //= 2
 
-        layers.append(nn.Conv2d(in_channels, out_channels, 3, 1, 1))
+        layers.append(nn.Conv3d(in_channels, out_channels, 3, 1, 1))
         layers.append(nn.Tanh())
 
         return nn.Sequential(*layers)

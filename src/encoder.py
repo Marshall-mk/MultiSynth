@@ -25,11 +25,11 @@ class ResidualBlock(nn.Module):
 
         padding = kernel_size // 2
 
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, 1, padding)
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size, 1, padding)
 
-        self.norm1 = nn.InstanceNorm2d(out_channels) if use_instance_norm else nn.Identity()
-        self.norm2 = nn.InstanceNorm2d(out_channels) if use_instance_norm else nn.Identity()
+        self.norm1 = nn.InstanceNorm3d(out_channels) if use_instance_norm else nn.Identity()
+        self.norm2 = nn.InstanceNorm3d(out_channels) if use_instance_norm else nn.Identity()
 
         if activation == 'leakyrelu':
             self.activation = nn.LeakyReLU(0.2, inplace=True)
@@ -43,7 +43,7 @@ class ResidualBlock(nn.Module):
         # Skip connection with 1x1 conv if dimensions change
         self.skip = nn.Identity()
         if in_channels != out_channels or stride != 1:
-            self.skip = nn.Conv2d(in_channels, out_channels, 1, stride)
+            self.skip = nn.Conv3d(in_channels, out_channels, 1, stride)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = self.skip(x)
@@ -88,7 +88,7 @@ class EncoderBlock(nn.Module):
         self.blocks = nn.Sequential(*layers)
 
         # Output layer produces 2x hidden_channels for mu and logvar
-        self.variational_proj = nn.Conv2d(hidden_channels, hidden_channels * 2, kernel_size=1)
+        self.variational_proj = nn.Conv3d(hidden_channels, hidden_channels * 2, kernel_size=1)
 
         self.hidden_channels = hidden_channels
 
@@ -103,8 +103,8 @@ class EncoderBlock(nn.Module):
         variational_params = self.variational_proj(features)
 
         # Split into mu and logvar
-        mu = variational_params[:, :self.hidden_channels, :, :]
-        logvar = variational_params[:, self.hidden_channels:, :, :]
+        mu = variational_params[:, :self.hidden_channels]
+        logvar = variational_params[:, self.hidden_channels:]
 
         # Clamp logvar for numerical stability (as in original implementation)
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)
@@ -144,8 +144,8 @@ class ConvEncoder(nn.Module):
         self.num_scales = num_scales
 
         # Initial projection
-        self.initial_conv = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
-        self.initial_norm = nn.InstanceNorm2d(base_channels)
+        self.initial_conv = nn.Conv3d(in_channels, base_channels, kernel_size=3, padding=1)
+        self.initial_norm = nn.InstanceNorm3d(base_channels)
         self.initial_act = nn.LeakyReLU(0.2, inplace=True) if activation == 'leakyrelu' else nn.ReLU(inplace=True)
 
         # Encoder blocks at each scale
@@ -174,7 +174,7 @@ class ConvEncoder(nn.Module):
         Encode input and return variational parameters at each scale.
 
         Args:
-            x: Input tensor of shape (B, C, H, W)
+            x: Input tensor of shape (B, C, D, H, W)
 
         Returns:
             List of dicts, each containing:

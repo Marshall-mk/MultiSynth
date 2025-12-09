@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
+from .utils import PixelShuffle3d
 
 
 class ResidualBlock(nn.Module):
@@ -30,11 +31,11 @@ class ResidualBlock(nn.Module):
 
         padding = kernel_size // 2
 
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, 1, padding)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, 1, padding)
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size, 1, padding)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size, 1, padding)
 
-        self.norm1 = nn.InstanceNorm2d(out_channels)
-        self.norm2 = nn.InstanceNorm2d(out_channels)
+        self.norm1 = nn.InstanceNorm3d(out_channels)
+        self.norm2 = nn.InstanceNorm3d(out_channels)
 
         if activation == 'leakyrelu':
             self.activation = nn.LeakyReLU(0.2, inplace=True)
@@ -48,7 +49,7 @@ class ResidualBlock(nn.Module):
         # Skip connection
         self.skip = nn.Identity()
         if in_channels != out_channels:
-            self.skip = nn.Conv2d(in_channels, out_channels, 1)
+            self.skip = nn.Conv3d(in_channels, out_channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = self.skip(x)
@@ -69,9 +70,9 @@ class ResidualBlock(nn.Module):
 class UpsampleBlock(nn.Module):
     """
     Upsampling block with multiple strategies:
-    - Bilinear interpolation + conv
+    - Trilinear interpolation + conv
     - Transposed convolution
-    - Sub-pixel convolution (PixelShuffle)
+    - Sub-pixel convolution (PixelShuffle3d)
     """
 
     def __init__(
@@ -79,37 +80,37 @@ class UpsampleBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         scale_factor: int = 2,
-        mode: str = 'bilinear'
+        mode: str = 'trilinear'
     ):
         """
         Args:
             in_channels: Input channels
             out_channels: Output channels
             scale_factor: Upsampling factor
-            mode: 'bilinear', 'transpose', or 'pixelshuffle'
+            mode: 'trilinear', 'transpose', or 'pixelshuffle'
         """
         super().__init__()
 
         self.mode = mode
         self.scale_factor = scale_factor
 
-        if mode == 'bilinear':
-            self.upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
-            self.conv = nn.Conv2d(in_channels, out_channels, 3, 1, 1)
+        if mode == 'trilinear':
+            self.upsample = nn.Upsample(scale_factor=scale_factor, mode='trilinear', align_corners=False)
+            self.conv = nn.Conv3d(in_channels, out_channels, 3, 1, 1)
         elif mode == 'transpose':
-            self.upsample = nn.ConvTranspose2d(
+            self.upsample = nn.ConvTranspose3d(
                 in_channels, out_channels, kernel_size=4, stride=scale_factor, padding=1
             )
             self.conv = nn.Identity()
         elif mode == 'pixelshuffle':
-            # PixelShuffle requires in_channels to be divisible by scale_factor^2
-            self.conv_expand = nn.Conv2d(in_channels, out_channels * (scale_factor ** 2), 3, 1, 1)
-            self.upsample = nn.PixelShuffle(scale_factor)
+            # PixelShuffle3d requires in_channels to be divisible by scale_factor^3
+            self.conv_expand = nn.Conv3d(in_channels, out_channels * (scale_factor ** 3), 3, 1, 1)
+            self.upsample = PixelShuffle3d(scale_factor)
             self.conv = nn.Identity()
         else:
             raise ValueError(f"Unknown upsample mode: {mode}")
 
-        self.norm = nn.InstanceNorm2d(out_channels)
+        self.norm = nn.InstanceNorm3d(out_channels)
         self.activation = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -180,7 +181,7 @@ class DecoderBlock(nn.Module):
         if skip is not None:
             # Resize skip if needed (should match after upsampling)
             if x.shape[2:] != skip.shape[2:]:
-                skip = F.interpolate(skip, size=x.shape[2:], mode='bilinear', align_corners=False)
+                skip = F.interpolate(skip, size=x.shape[2:], mode='trilinear', align_corners=False)
             x = torch.cat([x, skip], dim=1)
 
         # Process through residual blocks
@@ -242,10 +243,10 @@ class ConvDecoder(nn.Module):
 
         # Final output layer
         self.final_conv = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels, 3, 1, 1),
-            nn.InstanceNorm2d(base_channels),
+            nn.Conv3d(base_channels, base_channels, 3, 1, 1),
+            nn.InstanceNorm3d(base_channels),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base_channels, out_channels, 3, 1, 1)
+            nn.Conv3d(base_channels, out_channels, 3, 1, 1)
         )
 
         # Final activation
@@ -398,7 +399,7 @@ class MultiOutputDecoder(nn.Module):
 
 class PixelShuffleUpscaler(nn.Module):
     """
-    Final upscaling module using PixelShuffle for super-resolution.
+    Final upscaling module using PixelShuffle3d for super-resolution.
     Used when the output needs to be at a higher resolution than the decoder output.
     """
 
@@ -432,13 +433,13 @@ class PixelShuffleUpscaler(nn.Module):
                 break
 
             layers.extend([
-                nn.Conv2d(current_channels, current_channels * 4, 3, 1, 1),
-                nn.PixelShuffle(upscale),
+                nn.Conv3d(current_channels, current_channels * (upscale ** 3), 3, 1, 1),
+                PixelShuffle3d(upscale),
                 nn.LeakyReLU(0.2, inplace=True)
             ])
 
         # Final output conv
-        layers.append(nn.Conv2d(current_channels, out_channels, 3, 1, 1))
+        layers.append(nn.Conv3d(current_channels, out_channels, 3, 1, 1))
 
         self.upscaler = nn.Sequential(*layers)
 

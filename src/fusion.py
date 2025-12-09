@@ -62,14 +62,14 @@ class ProductOfGaussians(nn.Module):
         Compute fused posterior via product of Gaussians.
 
         Args:
-            mus: Dict mapping modality index to mu tensor (B, C, H, W)
-            logvars: Dict mapping modality index to logvar tensor (B, C, H, W)
+            mus: Dict mapping modality index to mu tensor (B, C, D, H, W)
+            logvars: Dict mapping modality index to logvar tensor (B, C, D, H, W)
             modality_mask: Optional boolean tensor (num_modalities,) indicating
                           which modalities to include
 
         Returns:
-            posterior_mu: Fused mean (B, C, H, W)
-            posterior_logvar: Fused log-variance (B, C, H, W)
+            posterior_mu: Fused mean (B, C, D, H, W)
+            posterior_logvar: Fused log-variance (B, C, D, H, W)
         """
         if len(mus) == 0:
             raise ValueError("At least one modality must be present")
@@ -240,12 +240,12 @@ class AttentionFusion(nn.Module):
         self.num_heads = num_heads
 
         # Attention layers
-        self.query = nn.Conv2d(hidden_dim, hidden_dim, 1)
-        self.key = nn.Conv2d(hidden_dim, hidden_dim, 1)
-        self.value = nn.Conv2d(hidden_dim, hidden_dim, 1)
+        self.query = nn.Conv3d(hidden_dim, hidden_dim, 1)
+        self.key = nn.Conv3d(hidden_dim, hidden_dim, 1)
+        self.value = nn.Conv3d(hidden_dim, hidden_dim, 1)
 
         # Output projection
-        self.proj = nn.Conv2d(hidden_dim, hidden_dim * 2, 1)  # For mu and logvar
+        self.proj = nn.Conv3d(hidden_dim, hidden_dim * 2, 1)  # For mu and logvar
 
     def forward(
         self,
@@ -276,15 +276,15 @@ class AttentionFusion(nn.Module):
             # Single modality, no attention needed
             fused = feat_list[0]
         else:
-            # Stack: (B, num_mod, C, H, W)
+            # Stack: (B, num_mod, C, D, H, W)
             stacked = torch.stack(feat_list, dim=1)
-            B, num_mod, C, H, W = stacked.shape
+            B, num_mod, C, D, H, W = stacked.shape
 
-            # Reshape for attention: (B*H*W, num_mod, C)
-            stacked = stacked.permute(0, 3, 4, 1, 2).reshape(B * H * W, num_mod, C)
+            # Reshape for attention: (B*D*H*W, num_mod, C)
+            stacked = stacked.permute(0, 3, 4, 5, 1, 2).reshape(B * D * H * W, num_mod, C)
 
             # Self-attention
-            Q = self.query(feat_list[0]).permute(0, 2, 3, 1).reshape(B * H * W, 1, C)
+            Q = self.query(feat_list[0]).permute(0, 2, 3, 4, 1).reshape(B * D * H * W, 1, C)
             K = stacked
             V = stacked
 
@@ -292,8 +292,8 @@ class AttentionFusion(nn.Module):
             attn = torch.softmax(torch.bmm(Q, K.transpose(1, 2)) / (C ** 0.5), dim=-1)
 
             # Weighted sum
-            fused = torch.bmm(attn, V).squeeze(1)  # (B*H*W, C)
-            fused = fused.reshape(B, H, W, C).permute(0, 3, 1, 2)
+            fused = torch.bmm(attn, V).squeeze(1)  # (B*D*H*W, C)
+            fused = fused.reshape(B, D, H, W, C).permute(0, 4, 1, 2, 3)
 
         # Project to mu and logvar
         out = self.proj(fused)

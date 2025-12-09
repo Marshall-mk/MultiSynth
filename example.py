@@ -1,289 +1,134 @@
+#!/usr/bin/env python3
 """
-Example usage of U-HVED for Super-Resolution
+Example demonstrating the three orthogonal LR stack generation.
 
-This script demonstrates:
-1. How to create and initialize the model
-2. How to prepare multi-modal inputs
-3. How to run inference
-4. How to handle missing modalities
-5. How to compute losses for training
+This shows how the modified data pipeline creates three low-resolution stacks
+from a single high-resolution volume, each with high resolution in one orientation.
 """
 
 import torch
-import torch.nn.functional as F
-from models import UHVED, UHVEDLoss, create_uhved
-
-
-def basic_usage():
-    """Basic usage example."""
-    print("=" * 60)
-    print("Basic U-HVED Usage")
-    print("=" * 60)
-
-    # Create model
-    model = UHVED(
-        num_modalities=4,      # Number of input types (e.g., different degradations)
-        in_channels=1,         # Channels per modality (1 for grayscale, 3 for RGB)
-        out_channels=1,        # Output channels
-        base_channels=32,      # Base feature channels
-        num_scales=4,          # Number of hierarchical scales
-        reconstruct_modalities=True  # Also reconstruct input modalities
-    )
-
-    # Create dummy input - 4 modalities, each (batch=2, channels=1, H=64, W=64)
-    batch_size = 2
-    height, width = 64, 64
-
-    modalities = [
-        torch.randn(batch_size, 1, height, width)  # Modality 1: e.g., bicubic downsampled
-        for _ in range(4)
-    ]
-
-    # Forward pass
-    model.eval()
-    with torch.no_grad():
-        outputs = model(modalities)
-
-    print(f"Input shape (per modality): {modalities[0].shape}")
-    print(f"SR Output shape: {outputs['sr_output'].shape}")
-    print(f"Number of reconstructed modalities: {len(outputs['modality_outputs'])}")
-    print(f"Number of posterior distributions: {len(outputs['posteriors'])}")
-
-    # Check posterior dimensions at each scale
-    for i, (mu, logvar) in enumerate(outputs['posteriors']):
-        print(f"  Scale {i}: mu shape = {mu.shape}, logvar shape = {logvar.shape}")
-
-
-def missing_modality_example():
-    """Example showing how to handle missing modalities."""
-    print("\n" + "=" * 60)
-    print("Handling Missing Modalities")
-    print("=" * 60)
-
-    model = UHVED(num_modalities=4, in_channels=1, out_channels=1)
-
-    batch_size = 2
-    height, width = 64, 64
-
-    # Create 4 modalities
-    modalities = [torch.randn(batch_size, 1, height, width) for _ in range(4)]
-
-    # Create mask: only modalities 0 and 2 are available
-    modality_mask = torch.tensor([True, False, True, False])
-
-    model.eval()
-    with torch.no_grad():
-        outputs = model(modalities, modality_mask=modality_mask)
-
-    print(f"Available modalities: {modality_mask.tolist()}")
-    print(f"SR Output shape: {outputs['sr_output'].shape}")
-    print("Model successfully handles missing modalities via Product of Gaussians fusion!")
-
-
-def training_example():
-    """Example showing training loop setup."""
-    print("\n" + "=" * 60)
-    print("Training Setup Example")
-    print("=" * 60)
-
-    # Create model
-    model = UHVED(
-        num_modalities=4,
-        in_channels=3,  # RGB images
-        out_channels=3,
-        base_channels=32,
-        num_scales=4,
-        reconstruct_modalities=True
-    )
-
-    # Create loss function
-    loss_fn = UHVEDLoss(
-        recon_loss_type='l1',        # L1 reconstruction loss
-        recon_weight=1.0,             # Weight for main SR loss
-        kl_weight=0.001,              # Weight for KL divergence
-        perceptual_weight=0.1,        # Weight for perceptual loss
-        modality_weight=0.5,          # Weight for modality reconstruction
-        use_perceptual=False,         # Disable perceptual loss for this example
-        kl_annealing=True,            # Gradually increase KL weight
-        kl_anneal_steps=10000         # Annealing steps
-    )
-
-    # Create optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-
-    # Dummy data
-    batch_size = 4
-    lr_size = 64   # Low-resolution input size
-    hr_size = 64   # High-resolution target size (same in this example)
-
-    # Multiple degraded inputs
-    modalities = [torch.randn(batch_size, 3, lr_size, lr_size) for _ in range(4)]
-    hr_target = torch.randn(batch_size, 3, hr_size, hr_size)
-
-    # Training step
-    model.train()
-
-    optimizer.zero_grad()
-
-    # Forward pass
-    outputs = model(modalities)
-
-    # Compute loss
-    losses = loss_fn(
-        sr_output=outputs['sr_output'],
-        sr_target=hr_target,
-        posteriors=outputs['posteriors'],
-        modality_outputs=outputs['modality_outputs'],
-        modality_targets=modalities,
-        return_components=True
-    )
-
-    # Backward pass
-    losses['total'].backward()
-    optimizer.step()
-
-    print("Loss components:")
-    for name, value in losses.items():
-        print(f"  {name}: {value.item():.4f}")
-
-
-def different_configs_example():
-    """Example showing different model configurations."""
-    print("\n" + "=" * 60)
-    print("Different Model Configurations")
-    print("=" * 60)
-
-    configs = ['default', 'lite', 'sr2x', 'sr4x']
-
-    for config_name in configs:
-        model = create_uhved(config_name, in_channels=3, out_channels=3)
-
-        # Count parameters
-        num_params = sum(p.numel() for p in model.parameters())
-
-        print(f"\n{config_name}:")
-        print(f"  Parameters: {num_params:,}")
-        print(f"  Type: {type(model).__name__}")
-
-
-def super_resolution_workflow():
-    """Complete super-resolution workflow example."""
-    print("\n" + "=" * 60)
-    print("Complete Super-Resolution Workflow")
-    print("=" * 60)
-
-    # Step 1: Define degradation functions
-    def create_degraded_modalities(hr_image: torch.Tensor, scale: int = 4):
-        """Create multiple degraded versions of an HR image."""
-        b, c, h, w = hr_image.shape
-        lr_h, lr_w = h // scale, w // scale
-
-        modalities = []
-
-        # Modality 1: Bicubic downsampling
-        lr_bicubic = F.interpolate(hr_image, size=(lr_h, lr_w), mode='bicubic', align_corners=False)
-        modalities.append(lr_bicubic)
-
-        # Modality 2: Bilinear downsampling
-        lr_bilinear = F.interpolate(hr_image, size=(lr_h, lr_w), mode='bilinear', align_corners=False)
-        modalities.append(lr_bilinear)
-
-        # Modality 3: Bicubic + noise
-        noise = torch.randn_like(lr_bicubic) * 0.05
-        lr_noisy = torch.clamp(lr_bicubic + noise, -1, 1)
-        modalities.append(lr_noisy)
-
-        # Modality 4: Area downsampling (different frequency characteristics)
-        lr_area = F.interpolate(hr_image, size=(lr_h, lr_w), mode='area')
-        modalities.append(lr_area)
-
-        return modalities
-
-    # Step 2: Create model
-    model = create_uhved('default', in_channels=3, out_channels=3)
-    model.eval()
-
-    # Step 3: Create synthetic HR image
-    hr_image = torch.randn(1, 3, 256, 256)
-
-    # Step 4: Create degraded inputs
-    modalities = create_degraded_modalities(hr_image, scale=4)
-
-    print(f"HR image shape: {hr_image.shape}")
-    print(f"LR modality shape: {modalities[0].shape}")
-    print(f"Number of modalities: {len(modalities)}")
-
-    # Step 5: Super-resolve
-    with torch.no_grad():
-        outputs = model(modalities)
-
-    sr_output = outputs['sr_output']
-    print(f"SR output shape: {sr_output.shape}")
-
-    # Step 6: Test with partial modalities
-    print("\nTesting robustness to missing modalities:")
-    for num_available in [4, 3, 2, 1]:
-        mask = torch.zeros(4, dtype=torch.bool)
-        mask[:num_available] = True
-
-        with torch.no_grad():
-            outputs = model(modalities, modality_mask=mask)
-
-        # Compute simple quality metric (MSE with HR target)
-        sr = outputs['sr_output']
-        # In real scenario, upsample HR target to match SR output size if needed
-        mse = F.mse_loss(sr, F.interpolate(hr_image, size=sr.shape[-2:], mode='bicubic', align_corners=False))
-        print(f"  {num_available} modalities available - Output MSE: {mse.item():.4f}")
-
-
-def latent_space_analysis():
-    """Example showing latent space properties."""
-    print("\n" + "=" * 60)
-    print("Latent Space Analysis")
-    print("=" * 60)
-
-    model = UHVED(num_modalities=4, in_channels=1, out_channels=1, num_scales=4)
-    model.eval()
-
-    # Create two similar images
-    img_a = torch.randn(1, 1, 64, 64)
-    img_b = img_a + torch.randn_like(img_a) * 0.1  # Slight perturbation
-
-    # Create modalities from each
-    modalities_a = [img_a.clone() for _ in range(4)]
-    modalities_b = [img_b.clone() for _ in range(4)]
-
-    with torch.no_grad():
-        outputs_a = model(modalities_a)
-        outputs_b = model(modalities_b)
-
-    # Compare latent representations at each scale
-    print("Latent space similarity across scales:")
-    for i, ((mu_a, _), (mu_b, _)) in enumerate(zip(outputs_a['posteriors'], outputs_b['posteriors'])):
-        # Compute cosine similarity
-        mu_a_flat = mu_a.flatten()
-        mu_b_flat = mu_b.flatten()
-        cosine_sim = F.cosine_similarity(mu_a_flat.unsqueeze(0), mu_b_flat.unsqueeze(0))
-        print(f"  Scale {i}: Cosine similarity = {cosine_sim.item():.4f}")
-
+from src.data import HRLRDataGenerator
 
 def main():
-    """Run all examples."""
-    print("\n" + "#" * 60)
-    print("# U-HVED Super-Resolution Examples")
-    print("#" * 60)
+    print("="*80)
+    print("Orthogonal LR Stack Generation Example")
+    print("="*80)
 
-    basic_usage()
-    missing_modality_example()
-    training_example()
-    different_configs_example()
-    super_resolution_workflow()
-    latent_space_analysis()
+    # Create the data generator
+    generator = HRLRDataGenerator(
+        atlas_res=[1.0, 1.0, 1.0],  # HR resolution
+        target_res=[1.0, 1.0, 1.0],  # Target resolution
+        output_shape=[128, 128, 128],  # Output shape
+        min_resolution=[1.0, 1.0, 1.0],  # Min (best) resolution
+        max_res_aniso=[9.0, 9.0, 9.0],  # Max (worst) resolution for anisotropic axes
+        randomise_res=True,  # Randomize low-res axes
+        prob_bias_field=0.5,
+        prob_noise=0.8,
+        prob_motion=0.2,
+        apply_intensity_aug=True,
+    )
 
-    print("\n" + "=" * 60)
-    print("All examples completed successfully!")
-    print("=" * 60)
+    # Create a synthetic high-resolution volume
+    batch_size = 2
+    hr_volume = torch.randn(batch_size, 1, 128, 128, 128)  # (B, C, D, H, W)
+
+    print(f"\nInput HR Volume Shape: {hr_volume.shape}")
+    print(f"  Batch: {hr_volume.shape[0]}")
+    print(f"  Channels: {hr_volume.shape[1]}")
+    print(f"  Depth (D): {hr_volume.shape[2]}")
+    print(f"  Height (H): {hr_volume.shape[3]}")
+    print(f"  Width (W): {hr_volume.shape[4]}")
+
+    # Generate three orthogonal LR stacks
+    print("\n" + "-"*80)
+    print("Generating three orthogonal LR stacks...")
+    print("-"*80)
+
+    lr_stacks, hr_augmented, resolutions, thicknesses = generator.generate_paired_data(
+        hr_volume,
+        return_resolution=True
+    )
+
+    print(f"\nNumber of LR stacks generated: {len(lr_stacks)}")
+    print(f"HR augmented shape: {hr_augmented.shape}")
+
+    # Display information about each stack
+    stack_names = ["Axial (high-res in D)", "Coronal (high-res in H)", "Sagittal (high-res in W)"]
+    axis_names = ["D (Depth)", "H (Height)", "W (Width)"]
+
+    for stack_idx in range(3):
+        print(f"\n{'='*80}")
+        print(f"Stack {stack_idx}: {stack_names[stack_idx]}")
+        print(f"{'='*80}")
+        print(f"Shape: {lr_stacks[stack_idx].shape}")
+
+        for batch_idx in range(batch_size):
+            print(f"\n  Batch {batch_idx}:")
+            print(f"    Resolution (mm):")
+            for axis_idx in range(3):
+                res_val = resolutions[stack_idx][batch_idx, axis_idx].item()
+                thick_val = thicknesses[stack_idx][batch_idx, axis_idx].item()
+                is_high_res = (axis_idx == stack_idx)
+                marker = "★ HIGH-RES" if is_high_res else "☆ low-res"
+                print(f"      {axis_names[axis_idx]}: {res_val:.2f} mm (thickness: {thick_val:.2f} mm) {marker}")
+
+    # Verify orthogonality
+    print(f"\n{'='*80}")
+    print("Verification: Each stack should have high resolution in different axes")
+    print(f"{'='*80}")
+
+    for stack_idx in range(3):
+        print(f"\nStack {stack_idx} ({stack_names[stack_idx]}):")
+        high_res_axes = []
+        for batch_idx in range(batch_size):
+            batch_high_res = []
+            for axis_idx in range(3):
+                res_val = resolutions[stack_idx][batch_idx, axis_idx].item()
+                if res_val < 2.0:  # Threshold for "high resolution"
+                    batch_high_res.append(axis_names[axis_idx])
+            high_res_axes.append(batch_high_res)
+
+        print(f"  High-res axes across batch: {high_res_axes}")
+
+        # Check if the expected axis is consistently high-res
+        expected_axis = axis_names[stack_idx]
+        all_correct = all(expected_axis in axes for axes in high_res_axes)
+        status = "✓ CORRECT" if all_correct else "✗ INCORRECT"
+        print(f"  Expected high-res axis: {expected_axis} {status}")
+
+    print(f"\n{'='*80}")
+    print("Example: Using with U-HVED Model")
+    print(f"{'='*80}")
+
+    print("\nThe three LR stacks can be fed directly to U-HVED:")
+    print("```python")
+    print("from src import UHVED")
+    print("")
+    print("# Create model with 3 modalities (one per orientation)")
+    print("model = UHVED(")
+    print("    num_modalities=3,")
+    print("    in_channels=1,")
+    print("    out_channels=1,")
+    print("    base_channels=32,")
+    print("    num_scales=4")
+    print(")")
+    print("")
+    print("# Feed the three orthogonal stacks")
+    print("outputs = model(lr_stacks)  # lr_stacks is the list of 3 LR volumes")
+    print("sr_output = outputs['sr_output']  # Super-resolved HR volume")
+    print("```")
+
+    print(f"\n{'='*80}")
+    print("Summary")
+    print(f"{'='*80}")
+    print(f"✓ Generated {len(lr_stacks)} orthogonal LR stacks from {batch_size} HR volumes")
+    print(f"✓ Stack 0: High resolution in axial (D) direction")
+    print(f"✓ Stack 1: High resolution in coronal (H) direction")
+    print(f"✓ Stack 2: High resolution in sagittal (W) direction")
+    print(f"✓ Each stack has independent degradations (bias, noise, motion, etc.)")
+    print(f"✓ Ready to feed into U-HVED model for multi-modal super-resolution")
+    print("="*80)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

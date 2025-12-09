@@ -18,7 +18,7 @@ from pathlib import Path
 from src import UHVED, UHVEDLite, UHVEDWithUpscale, create_uhved
 
 
-def create_sample_inputs(num_modalities=4, in_channels=3, height=64, width=64, batch_size=1):
+def create_sample_inputs(num_modalities=3, in_channels=1, height=64, width=64, batch_size=1):
     """
     Create sample input tensors for the model.
 
@@ -71,7 +71,7 @@ def visualize_uhved_config(config_name, output_dir="architecture_plots"):
     elif config_name == "custom":
         # Custom configuration example
         model = UHVED(
-            num_modalities=2,
+            num_modalities=3,
             in_channels=1,
             out_channels=1,
             base_channels=16,
@@ -95,20 +95,8 @@ def visualize_uhved_config(config_name, output_dir="architecture_plots"):
     print(f"Trainable parameters: {num_trainable:,}")
 
     # Create sample inputs
-    # Get configuration details
-    if hasattr(model, 'num_modalities'):
-        num_modalities = model.num_modalities
-    elif hasattr(model, 'uhved'):
-        num_modalities = model.uhved.num_modalities
-    else:
-        num_modalities = 4
-
-    if hasattr(model, 'in_channels'):
-        in_channels = model.in_channels
-    elif hasattr(model, 'uhved'):
-        in_channels = model.uhved.in_channels
-    else:
-        in_channels = 3
+    num_modalities = 3
+    in_channels = 1
 
     print(f"Input shape per modality: (1, {in_channels}, {input_size[0]}, {input_size[1]})")
     print(f"Number of modalities: {num_modalities}")

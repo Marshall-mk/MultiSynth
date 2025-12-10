@@ -237,6 +237,77 @@ def print_model_statistics(model: nn.Module, input_shapes: Optional[List[Tuple]]
     print("=" * 80)
 
 
+def get_gpu_memory_stats(device: Optional[torch.device] = None):
+    """
+    Get current GPU memory usage statistics.
+
+    Args:
+        device: CUDA device to query. If None, uses current device.
+
+    Returns:
+        Dictionary with memory statistics in MB, or None if not using CUDA
+    """
+    if not torch.cuda.is_available():
+        return None
+
+    if device is None:
+        device = torch.cuda.current_device()
+    elif isinstance(device, str):
+        device = torch.device(device)
+
+    # Get device index
+    if device.type != 'cuda':
+        return None
+
+    device_idx = device.index if device.index is not None else torch.cuda.current_device()
+
+    # Memory statistics
+    allocated = torch.cuda.memory_allocated(device_idx) / (1024 ** 2)  # MB
+    reserved = torch.cuda.memory_reserved(device_idx) / (1024 ** 2)    # MB
+    max_allocated = torch.cuda.max_memory_allocated(device_idx) / (1024 ** 2)  # MB
+    max_reserved = torch.cuda.max_memory_reserved(device_idx) / (1024 ** 2)    # MB
+
+    # Get total GPU memory
+    total_memory = torch.cuda.get_device_properties(device_idx).total_memory / (1024 ** 2)  # MB
+
+    return {
+        'allocated_mb': allocated,
+        'reserved_mb': reserved,
+        'max_allocated_mb': max_allocated,
+        'max_reserved_mb': max_reserved,
+        'total_mb': total_memory,
+        'utilization_pct': (allocated / total_memory) * 100 if total_memory > 0 else 0
+    }
+
+
+def print_gpu_memory_stats(device: Optional[torch.device] = None, prefix: str = ""):
+    """
+    Print formatted GPU memory statistics.
+
+    Args:
+        device: CUDA device to query
+        prefix: Optional prefix for the output (e.g., "After first batch: ")
+    """
+    stats = get_gpu_memory_stats(device)
+
+    if stats is None:
+        print(f"{prefix}GPU memory tracking not available (not using CUDA)")
+        return
+
+    print("=" * 80)
+    if prefix:
+        print(f"{prefix.upper()}")
+    print("GPU MEMORY USAGE")
+    print("=" * 80)
+    print(f"Allocated:               {stats['allocated_mb']:>15.2f} MB")
+    print(f"Reserved (cached):       {stats['reserved_mb']:>15.2f} MB")
+    print(f"Max allocated:           {stats['max_allocated_mb']:>15.2f} MB")
+    print(f"Max reserved:            {stats['max_reserved_mb']:>15.2f} MB")
+    print(f"Total GPU memory:        {stats['total_mb']:>15.2f} MB")
+    print(f"Utilization:             {stats['utilization_pct']:>15.1f} %")
+    print("=" * 80)
+
+
 # =============================================================================
 # Data Loading Utilities
 # =============================================================================

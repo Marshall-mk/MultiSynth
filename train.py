@@ -42,6 +42,8 @@ from src.utils import (
     calculate_metrics,
     sliding_window_inference,
     print_model_statistics,
+    get_gpu_memory_stats,
+    print_gpu_memory_stats,
 )
 
 
@@ -67,6 +69,8 @@ def train_uhved_model(
     prob_bias_field: float = 0.5,
     prob_noise: float = 0.8,
     apply_intensity_aug: bool = True,
+    modality_dropout_prob: float = 0.0,
+    min_modalities: int = 1,
     num_workers: int = None,
     use_cache: bool = False,
     use_wandb: bool = False,
@@ -116,6 +120,8 @@ def train_uhved_model(
         prob_bias_field: Probability of bias field
         prob_noise: Probability of noise
         apply_intensity_aug: Whether to apply intensity augmentation
+        modality_dropout_prob: Probability of applying modality dropout (0.0-1.0)
+        min_modalities: Minimum number of modalities to keep after dropout (1-3)
         num_workers: Number of data loading workers
         use_cache: Whether to use CacheDataset
         use_wandb: Whether to use Weights & Biases for tracking
@@ -188,6 +194,9 @@ def train_uhved_model(
         print(f"  - Stack 0: High-res in Axial (D) direction")
         print(f"  - Stack 1: High-res in Coronal (H) direction")
         print(f"  - Stack 2: High-res in Sagittal (W) direction")
+        if modality_dropout_prob > 0.0:
+            print(f"Modality dropout enabled: {modality_dropout_prob:.2f} probability, min {min_modalities} modalities")
+            print(f"  → Training will randomly drop views to simulate missing data")
 
     generator = HRLRDataGenerator(
         atlas_res=atlas_res,
@@ -203,6 +212,8 @@ def train_uhved_model(
         prob_noise=prob_noise,
         apply_intensity_aug=apply_intensity_aug,
         clip_to_unit_range=True,
+        modality_dropout_prob=modality_dropout_prob,
+        min_modalities=min_modalities,
     )
 
     # Create dataset
@@ -430,8 +441,8 @@ def train_uhved_model(
         )
 
         for batch_idx, batch_data in enumerate(pbar):
-            # Unpack batch: (lr_stacks_list, hr, resolutions_list, thicknesses_list)
-            lr_stacks_list, target_img, resolutions_list, thicknesses_list = batch_data
+            # Unpack batch: (lr_stacks_list, hr, resolutions_list, thicknesses_list, modality_mask)
+            lr_stacks_list, target_img, resolutions_list, thicknesses_list, modality_mask = batch_data
 
             # lr_stacks_list is a list of 3 tensors, each (B, C, D, H, W)
             # We need to convert to the format U-HVED expects: list of (B, C, D, H, W)
@@ -443,6 +454,9 @@ def train_uhved_model(
 
             # Forward and backward pass
             with accelerator.accumulate(model):
+                # Note: We don't pass modality_mask because we already zeroed out
+                # dropped modalities in the data generator. The zeroed modalities
+                # will naturally contribute near-zero to the Product of Gaussians fusion.
                 outputs = model(modalities)
 
                 # Compute loss
@@ -475,9 +489,9 @@ def train_uhved_model(
             epoch_perceptual_loss += losses['perceptual'].item() if 'perceptual' in losses else 0.0
             epoch_modality_loss += losses['modality'].item() if 'modality' in losses else 0.0
 
-            # Update progress bar
+            # Update progress bar with loss and memory
             current_lr = optimizer.param_groups[0]['lr']
-            pbar.set_postfix({
+            postfix_dict = {
                 "loss": f"{loss.item():.4f}",
                 "recon": f"{losses['reconstruction'].item():.4f}",
                 "kl": f"{losses['kl'].item():.4f}",
@@ -485,7 +499,20 @@ def train_uhved_model(
                 "perceptual": f"{losses['perceptual'].item():.4f}" if 'perceptual' in losses else "N/A",
                 "modality": f"{losses['modality'].item():.4f}" if 'modality' in losses else "N/A",
                 "lr": f"{current_lr:.2e}"
-            })
+            }
+
+            # Add GPU memory to progress bar (update every 10 batches to avoid overhead)
+            if batch_idx % 10 == 0:
+                mem_stats = get_gpu_memory_stats(accelerator.device)
+                if mem_stats:
+                    postfix_dict["mem"] = f"{mem_stats['allocated_mb']:.0f}MB"
+
+            pbar.set_postfix(postfix_dict)
+
+            # Print actual GPU memory usage after first batch (once per training run)
+            if epoch == start_epoch and batch_idx == 0 and accelerator.is_main_process:
+                print()  # New line after progress bar
+                print_gpu_memory_stats(accelerator.device, prefix="After first batch")
 
         avg_loss = epoch_loss / len(dataloader)
         avg_recon = epoch_recon_loss / len(dataloader)
@@ -508,7 +535,7 @@ def train_uhved_model(
 
             with torch.no_grad():
                 for val_batch_data in val_dataloader:
-                    lr_stacks_list, target_img, _, _ = val_batch_data
+                    lr_stacks_list, target_img, _, _, modality_mask = val_batch_data
                     modalities = [m.float() for m in lr_stacks_list]
                     target_img = target_img.float()
 
@@ -527,6 +554,8 @@ def train_uhved_model(
                         )
                         outputs = {'sr_output': sr_output, 'posteriors': None}
                     else:
+                        # Note: We don't pass modality_mask - zeroed modalities
+                        # naturally contribute near-zero to the fusion
                         outputs = model(modalities)
 
                     losses = criterion(
@@ -738,6 +767,10 @@ def train_uhved_model(
         if best_val_loss < float('inf'):
             print(f"Best validation loss: {best_val_loss:.4f}")
 
+        # Print peak memory usage summary
+        print()
+        print_gpu_memory_stats(accelerator.device, prefix="Training Complete - Peak Memory")
+
         if use_wandb:
             artifact = wandb.Artifact(
                 name=f"model-{wandb.run.id}",
@@ -807,6 +840,15 @@ if __name__ == "__main__":
     parser.add_argument("--prob_bias_field", type=float, default=0.5, help="Probability of bias field")
     parser.add_argument("--prob_noise", type=float, default=0.8, help="Probability of noise")
     parser.add_argument("--no_intensity_aug", action="store_true", help="Disable intensity augmentation")
+
+    # Modality dropout (for robust training with missing views)
+    parser.add_argument("--modality_dropout_prob", type=float, default=0.0,
+                        help="Probability of applying modality dropout (0.0-1.0). "
+                             "Randomly drops 1-2 orthogonal views to simulate missing data during inference. "
+                             "Default: 0.0 (no dropout)")
+    parser.add_argument("--min_modalities", type=int, default=1,
+                        help="Minimum number of modalities to keep after dropout (1-3). "
+                             "Default: 1 (allows training with single views)")
 
     # Other parameters
     parser.add_argument("--device", type=str, default="cuda", help="Device")
@@ -896,6 +938,8 @@ if __name__ == "__main__":
         prob_bias_field=args.prob_bias_field,
         prob_noise=args.prob_noise,
         apply_intensity_aug=not args.no_intensity_aug,
+        modality_dropout_prob=args.modality_dropout_prob,
+        min_modalities=args.min_modalities,
         num_workers=args.num_workers,
         use_cache=args.use_cache,
         use_wandb=args.use_wandb,

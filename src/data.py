@@ -742,6 +742,11 @@ class HRLRDataGenerator:
         randomise_res: If True, randomize acquisition resolution
         apply_intensity_aug: If True, apply intensity augmentation to LR
         clip_to_unit_range: If True, clip outputs to [0, 1] range
+        modality_dropout_prob: Probability of applying modality dropout (0.0-1.0).
+                              When applied, randomly drops 1-2 modalities to simulate
+                              missing views during inference. Default: 0.0 (no dropout)
+        min_modalities: Minimum number of modalities to keep after dropout (1-3).
+                       Default: 1 (allows training with single views)
     """
 
     def __init__(
@@ -762,6 +767,9 @@ class HRLRDataGenerator:
         # Toggles
         apply_intensity_aug: bool = True,
         clip_to_unit_range: bool = True,
+        # Modality dropout (for robust training with missing views)
+        modality_dropout_prob: float = 0.0,
+        min_modalities: int = 1,
     ):
         self.atlas_res = atlas_res
         self.target_res = target_res
@@ -769,8 +777,12 @@ class HRLRDataGenerator:
         self.randomise_res = randomise_res
         self.apply_intensity_aug = apply_intensity_aug
         self.clip_to_unit_range = clip_to_unit_range
-        
+
         self.prob_bias_field = prob_bias_field
+
+        # Modality dropout parameters
+        self.modality_dropout_prob = modality_dropout_prob
+        self.min_modalities = max(1, min(min_modalities, 3))  # Clamp to [1, 3]
 
         # 1. Resolution Sampler
         if randomise_res:
@@ -820,6 +832,42 @@ class HRLRDataGenerator:
     def _normalize_image(self, image: torch.Tensor) -> torch.Tensor:
         """Normalize image to [0, 1] range using percentile scaling."""
         return self.normalizer(image)
+
+    def _create_modality_mask(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """
+        Create modality mask for dropout (simulating missing views).
+
+        Args:
+            batch_size: Number of volumes in batch
+            device: Device to create tensors on
+
+        Returns:
+            Boolean mask of shape (batch_size, 3) where True indicates modality is present.
+            Always ensures at least min_modalities are present per sample.
+        """
+        # Start with all modalities present
+        mask = torch.ones(batch_size, 3, dtype=torch.bool, device=device)
+
+        # Apply dropout with probability
+        if self.modality_dropout_prob > 0.0:
+            for b in range(batch_size):
+                # Decide whether to apply dropout for this sample
+                if torch.rand(1).item() < self.modality_dropout_prob:
+                    # Randomly select how many modalities to keep
+                    # Keep between min_modalities and 3
+                    num_keep = torch.randint(
+                        self.min_modalities,
+                        4,  # Upper bound is exclusive, so this gives [min_modalities, 3]
+                        (1,)
+                    ).item()
+
+                    if num_keep < 3:
+                        # Randomly select which modalities to keep
+                        indices = torch.randperm(3)[:num_keep]
+                        mask[b, :] = False
+                        mask[b, indices] = True
+
+        return mask
 
     def _create_orthogonal_resolutions(
         self,
@@ -918,9 +966,10 @@ class HRLRDataGenerator:
 
         Returns:
             If return_resolution=False:
-                (lr_stack_list, hr_augmented) where lr_stack_list contains 3 LR volumes
+                (lr_stack_list, hr_augmented, modality_mask)
+                where lr_stack_list contains 3 LR volumes and modality_mask is (B, 3)
             If return_resolution=True:
-                (lr_stack_list, hr_augmented, resolutions, thicknesses)
+                (lr_stack_list, hr_augmented, resolutions, thicknesses, modality_mask)
         """
         batch_size = hr_images.shape[0]
         device = hr_images.device
@@ -980,10 +1029,21 @@ class HRLRDataGenerator:
         # HR is already normalized by percentiles; clip tiny float drift
         hr_augmented = torch.clamp(hr_augmented, 0.0, 1.0)
 
+        # === STEP 4: APPLY MODALITY DROPOUT (if enabled) ===
+        # Create modality mask for simulating missing views
+        modality_mask = self._create_modality_mask(batch_size, device)
+
+        # Zero out dropped modalities
+        for stack_idx in range(3):
+            for b in range(batch_size):
+                if not modality_mask[b, stack_idx]:
+                    # Zero out this modality for this sample
+                    lr_stacks[stack_idx][b] = 0.0
+
         if return_resolution:
-            return lr_stacks, hr_augmented, resolutions, thicknesses
+            return lr_stacks, hr_augmented, resolutions, thicknesses, modality_mask
         else:
-            return lr_stacks, hr_augmented
+            return lr_stacks, hr_augmented, modality_mask
 
 
 # --- Dataset Wrappers ---
@@ -1019,19 +1079,24 @@ class GeneratorDataset(torch.utils.data.Dataset):
         )
 
         if self.return_resolution:
-            lr_stacks, hr_augmented, resolutions, thicknesses = result
+            lr_stacks, hr_augmented, resolutions, thicknesses, modality_mask = result
             # lr_stacks is a list of 3 tensors, each (1, C, D, H, W)
             # Return them as separate modalities
             return (
                 [stack.squeeze(0) for stack in lr_stacks],  # List of 3 modalities
                 hr_augmented.squeeze(0),  # HR ground truth
                 [res.squeeze(0) for res in resolutions],  # List of 3 resolution configs
-                [thick.squeeze(0) for thick in thicknesses]  # List of 3 thickness configs
+                [thick.squeeze(0) for thick in thicknesses],  # List of 3 thickness configs
+                modality_mask.squeeze(0)  # Modality mask (3,)
             )
         else:
-            lr_stacks, hr_augmented = result
+            lr_stacks, hr_augmented, modality_mask = result
             # Return the three LR stacks as a list
-            return [stack.squeeze(0) for stack in lr_stacks], hr_augmented.squeeze(0)
+            return (
+                [stack.squeeze(0) for stack in lr_stacks],
+                hr_augmented.squeeze(0),
+                modality_mask.squeeze(0)
+            )
 
 
 def create_dataset(

@@ -22,8 +22,8 @@ from monai.data import Dataset, CacheDataset
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, Orientationd,
     Spacingd, CropForegroundd, RandSpatialCropd, SpatialPadd,
-    ToTensord, GaussianSmooth, ScaleIntensityRangePercentiles,
-    CenterSpatialCropd, Resize,
+    ToTensord, ScaleIntensityRangePercentiles,
+    CenterSpatialCropd, Resize, RandAffined,
 )
 
 
@@ -533,111 +533,7 @@ class SampleResolution(nn.Module):
             return resolution
 
 
-def blurring_sigma_for_downsampling(
-    current_res: Union[torch.Tensor, np.ndarray, List[float]],
-    downsample_res: Union[torch.Tensor, np.ndarray, List[float]],
-    thickness: Optional[Union[torch.Tensor, np.ndarray, List[float]]] = None,
-    mult_coef: float = 0.42,
-) -> torch.Tensor:
-    """
-    Compute Gaussian blur sigma for anti-aliasing before downsampling.
-    Used for generic anti-aliasing approximations when physics-based SliceProfile is disabled.
-    Formula: sigma = mult_coef * max(thickness, downsample_res) / current_res
-    """
-    device = None
-    if isinstance(current_res, torch.Tensor):
-        device = current_res.device
-    elif isinstance(downsample_res, torch.Tensor):
-        device = downsample_res.device
-    elif isinstance(thickness, torch.Tensor):
-        device = thickness.device
-
-    # Convert all inputs to tensors
-    if not isinstance(current_res, torch.Tensor):
-        current_res = torch.tensor(current_res, dtype=torch.float32, device=device)
-    if not isinstance(downsample_res, torch.Tensor):
-        downsample_res = torch.tensor(
-            downsample_res, dtype=torch.float32, device=device
-        )
-
-    if thickness is None:
-        thickness = downsample_res
-    elif not isinstance(thickness, torch.Tensor):
-        thickness = torch.tensor(thickness, dtype=torch.float32, device=device)
-
-    # Use maximum of thickness and resolution for conservative blurring
-    max_res = torch.maximum(thickness, downsample_res)
-    sigma = mult_coef * max_res / current_res
-    return sigma
-
-# --- 2. Dynamic Gaussian Blur Helper ---
-
-def apply_dynamic_gaussian_blur(img: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    """
-    Applies a separable 3D Gaussian blur with dynamic sigmas per dimension.
-    
-    Args:
-        img: Input tensor (C, D, H, W)
-        sigma: Sigma values for [D, H, W] dimensions
-    """
-    device = img.device
-    channels = img.shape[0]
-    
-    # Process each spatial dimension (Separable convolution: Blur Z -> Blur Y -> Blur X)
-    for i, dim in enumerate([1, 2, 3]): # D, H, W correspond to dims 1, 2, 3
-        s = sigma[i].item()
-        
-        # Skip if sigma is negligible
-        if s < 0.1:
-            continue
-            
-        # Calculate kernel size (3 sigmas either side)
-        kernel_size = int(math.ceil(3 * s) * 2 + 1)
-        # Ensure odd size
-        if kernel_size % 2 == 0: kernel_size += 1
-            
-        # Create 1D Gaussian Kernel
-        x = torch.arange(kernel_size, dtype=torch.float32, device=device) - kernel_size // 2
-        kernel = torch.exp(-0.5 * (x / s) ** 2)
-        kernel = kernel / kernel.sum()
-        
-        # Reshape for conv1d: (Out_C, In_C/Groups, K) -> (C, 1, K)
-        kernel = kernel.view(1, 1, -1).repeat(channels, 1, 1)
-        
-        # We need to reshape img to use conv1d on the specific dimension
-        # Move target dim to last, flatten others
-        if i == 0: # Depth (D)
-            # (C, D, H, W) -> (C, H, W, D) -> (C*H*W, 1, D)
-            permute_shape = (0, 2, 3, 1) 
-            inv_permute = (0, 3, 1, 2)
-        elif i == 1: # Height (H)
-            permute_shape = (0, 1, 3, 2)
-            inv_permute = (0, 1, 3, 2)
-        else: # Width (W)
-            permute_shape = (0, 1, 2, 3) # Already last
-            inv_permute = (0, 1, 2, 3)
-            
-        img_perm = img.permute(*permute_shape)
-        orig_shape = img_perm.shape
-        
-        # Reshape for conv1d: (Batch, Channel, Length)
-        # Here we treat (C, H, W) as "Batch" and D as "Length"
-        flat_img = img_perm.reshape(-1, 1, orig_shape[-1])
-        
-        # Convolve
-        # Padding = same
-        blurred_flat = torch.nn.functional.conv1d(
-            flat_img, 
-            kernel[0:1], # Shared kernel
-            padding=kernel_size//2
-        )
-        
-        # Restore shape
-        img = blurred_flat.reshape(orig_shape).permute(*inv_permute)
-
-    return img
-
-# --- 3. Artifact Helpers (Motion, Spikes, Aliasing) ---
+# ---  Artifact Helpers (Motion, Spikes, Aliasing) ---
 
 def apply_kspace_motion_ghosting(volume: torch.Tensor, axis: int, intensity: float = 0.5, num_ghosts: int = 2) -> torch.Tensor:
     """
@@ -698,7 +594,7 @@ def apply_aliasing(volume: torch.Tensor, axis: int, fold_pct: float = 0.2) -> to
     return (volume + wrapped) / 1.5
 
 
-# --- 4. Main Simulator Class ---
+# ---  Main Simulator Class ---
 
 class MRIArtifactSimulator(torch.nn.Module):
     """
@@ -723,9 +619,9 @@ class MRIArtifactSimulator(torch.nn.Module):
         prob_spike: float = 0.1,
         prob_aliasing: float = 0.1,
         prob_noise: float = 0.95,
-        noise_std: float = 0.01,
-        motion_intensity: float = 0.5,
-        spike_intensity: float = 2.0,
+        noise_std: float = 0.05,
+        motion_intensity: float = 1.5,
+        spike_intensity: float = 0.04,
     ):
         super().__init__()
         self.volume_res = torch.tensor(volume_res, dtype=torch.float32)
@@ -763,17 +659,6 @@ class MRIArtifactSimulator(torch.nn.Module):
                 thk = acq_res
 
             # --- STEP 1: PSF Blurring (Slice Profile / Partial Volume) ---
-            # Using your provided function
-            # sigma = blurring_sigma_for_downsampling(
-            #     current_res=self.volume_res.to(device),
-            #     downsample_res=acq_res,
-            #     thickness=thk
-            # )
-            
-            # # Apply the calculated blur BEFORE any downsampling or k-space corruption
-            # # This simulates the physical magnetization averaging over the voxel
-            # img = apply_dynamic_gaussian_blur(img, sigma)
-
             img = self.physics_engine(
                 img, 
                 resolution=self.volume_res.to(device), # Current HR resolution
@@ -957,10 +842,25 @@ class HRLRDataGenerator:
             Tuple of (resolutions_list, thickness_list), each containing 3 tensors
             of shape (batch_size, 3) for the three orthogonal stacks
         """
-        min_res = torch.tensor(self.res_sampler.min_res if hasattr(self, 'res_sampler')
-                              else [1.0, 1.0, 1.0], device=device)
-        max_res = torch.tensor(self.res_sampler.max_res_aniso if hasattr(self, 'res_sampler')
-                              else [9.0, 9.0, 9.0], device=device)
+        # Handle min_res - could be tensor or list
+        if hasattr(self, 'res_sampler'):
+            min_res_value = self.res_sampler.min_res
+            if isinstance(min_res_value, torch.Tensor):
+                min_res = min_res_value.detach().clone().to(device)
+            else:
+                min_res = torch.tensor(min_res_value, device=device)
+        else:
+            min_res = torch.tensor([1.0, 1.0, 1.0], device=device)
+
+        # Handle max_res - could be tensor or list
+        if hasattr(self, 'res_sampler'):
+            max_res_value = self.res_sampler.max_res_aniso
+            if isinstance(max_res_value, torch.Tensor):
+                max_res = max_res_value.detach().clone().to(device)
+            else:
+                max_res = torch.tensor(max_res_value, device=device)
+        else:
+            max_res = torch.tensor([9.0, 9.0, 9.0], device=device)
 
         resolutions = []
         thicknesses = []
@@ -1054,26 +954,28 @@ class HRLRDataGenerator:
             lr_images = self.artifact_simulator(lr_images, resolution, thickness)
 
             # === STEP 4: REALISTIC LR INTENSITY NORMALIZATION ===
-            lr_norm = []
-            for b in range(batch_size):
-                lr_b = lr_images[b:b+1]
+            if self.clip_to_unit_range:
+                # Per-volume normalization to [0, 1] using soft clipping and min-max
+                lr_norm = []
+                for b in range(batch_size):
+                    lr_b = lr_images[b:b+1]
 
-                # (1) Compute soft clipping bounds
-                low = torch.quantile(lr_b, 0.005)
-                high = torch.quantile(lr_b, 0.995)
+                    # (1) Compute soft clipping bounds
+                    low = torch.quantile(lr_b, 0.005)
+                    high = torch.quantile(lr_b, 0.995)
 
-                # (2) Apply clipping
-                lr_b = torch.clamp(lr_b, low, high)
+                    # (2) Apply clipping
+                    lr_b = torch.clamp(lr_b, low, high)
 
-                # (3) Global min-max normalization
-                min_val = lr_b.min()
-                max_val = lr_b.max()
-                lr_b = (lr_b - min_val) / (max_val - min_val + 1e-8)
+                    # (3) Global min-max normalization
+                    min_val = lr_b.min()
+                    max_val = lr_b.max()
+                    lr_b = (lr_b - min_val) / (max_val - min_val + 1e-8)
 
-                lr_norm.append(lr_b)
+                    lr_norm.append(lr_b)
 
-            lr_images = torch.cat(lr_norm, dim=0)
-            lr_stacks.append(lr_images)
+                lr_images = torch.cat(lr_norm, dim=0)
+                lr_stacks.append(lr_images)
 
         # HR is already normalized by percentiles; clip tiny float drift
         hr_augmented = torch.clamp(hr_augmented, 0.0, 1.0)
@@ -1163,7 +1065,20 @@ def create_dataset(
         else:
             transforms.append(CenterSpatialCropd(keys=["image"], roi_size=target_shape))
             transforms.append(SpatialPadd(keys=["image"], spatial_size=target_shape))
-
+    
+    if is_training:
+        transforms.append(
+            RandAffined(
+                keys=["image"],
+                prob=0.3,                       
+                rotate_range=(0.1, 0.1, 0.1),
+                scale_range=(0.1, 0.1, 0.1),
+                shear_range=None,
+                translate_range=(5, 5, 5),     # optional
+                mode="bilinear",
+                padding_mode="border",
+            )
+        )
     transforms.append(ToTensord(keys=["image"]))
     transform = Compose(transforms)
 

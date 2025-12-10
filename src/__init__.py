@@ -7,7 +7,13 @@ from .uhved import UHVED, UHVEDWithUpscale, UHVEDLite, create_uhved
 from .encoder import ConvEncoder
 from .decoder import ConvDecoder
 from .fusion import ProductOfGaussians
-from .losses import UHVEDLoss
+
+from .losses import (
+    PerceptualLoss3D,
+    SSIM3DLoss,
+    UHVEDLoss,
+    create_uhved_loss
+)
 
 __all__ = [
     'UHVED',
@@ -17,5 +23,8 @@ __all__ = [
     'ConvEncoder',
     'ConvDecoder',
     'ProductOfGaussians',
-    'UHVEDLoss'
+    'PerceptualLoss3D',
+    'SSIM3DLoss',
+    'UHVEDLoss',
+    'create_uhved_loss'
 ]

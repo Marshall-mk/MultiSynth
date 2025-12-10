@@ -34,135 +34,15 @@ from monai.data import DataLoader
 # Import our modules
 from src import UHVED, UHVEDLoss, create_uhved
 from src.data import HRLRDataGenerator, create_dataset
-
-
-def calculate_metrics(pred, target, max_val=1.0):
-    """Calculate regression metrics."""
-    with torch.no_grad():
-        mae = torch.mean(torch.abs(pred - target)).item()
-        mse = torch.mean((pred - target) ** 2).item()
-        rmse = torch.sqrt(torch.tensor(mse)).item()
-
-        # PSNR
-        if mse > 0:
-            psnr = 20 * torch.log10(torch.tensor(max_val) / torch.sqrt(torch.tensor(mse))).item()
-        else:
-            psnr = 100.0
-
-        # R-squared
-        ss_res = torch.sum((target - pred) ** 2).item()
-        ss_tot = torch.sum((target - torch.mean(target)) ** 2).item()
-        r2 = 1 - (ss_res / (ss_tot + 1e-8))
-
-        # SSIM (simplified)
-        ssim = 1.0 - mae / max_val  # Placeholder
-
-        return {
-            'mae': mae,
-            'mse': mse,
-            'rmse': rmse,
-            'psnr': psnr,
-            'r2': r2,
-            'ssim': ssim
-        }
-
-
-def get_image_paths(image_dir, csv_file=None, base_dir=None, split="train",
-                   model_dir=None, mri_classifications=None):
-    """Get image paths from directory or CSV file."""
-    import glob
-
-    if csv_file and os.path.exists(csv_file):
-        # Load from CSV
-        import pandas as pd
-        df = pd.read_csv(csv_file)
-
-        # Filter by split
-        if 'split' in df.columns:
-            df = df[df['split'] == split]
-
-        # Filter by MRI classification if specified
-        if mri_classifications and 'mri_classification' in df.columns:
-            df = df[df['mri_classification'].isin(mri_classifications)]
-
-        # Get paths
-        if 'path' in df.columns:
-            paths = df['path'].tolist()
-            if base_dir:
-                paths = [os.path.join(base_dir, p) if not os.path.isabs(p) else p for p in paths]
-            return paths
-
-    # Load from directory
-    if image_dir and os.path.exists(image_dir):
-        extensions = ['*.nii', '*.nii.gz', '*.mgz', '*.mgh']
-        paths = []
-        for ext in extensions:
-            paths.extend(glob.glob(os.path.join(image_dir, '**', ext), recursive=True))
-        return sorted(paths)
-
-    return []
-
-
-def save_training_config(model_dir, args, n_train_samples, n_val_samples, training_stage):
-    """Save training configuration to JSON."""
-    import json
-
-    config = {
-        'training_stage': training_stage,
-        'model_architecture': 'uhved',
-        'num_modalities': 3,  # Fixed: axial, coronal, sagittal
-        'n_train_samples': n_train_samples,
-        'n_val_samples': n_val_samples,
-        'epochs': args.epochs,
-        'batch_size': args.batch_size,
-        'learning_rate': args.learning_rate,
-        'output_shape': args.output_shape,
-        'atlas_res': args.atlas_res,
-        'min_resolution': args.min_resolution,
-        'max_res_aniso': args.max_res_aniso,
-    }
-
-    config_path = os.path.join(model_dir, 'training_config.json')
-    with open(config_path, 'w') as f:
-        json.dump(config, f, indent=2)
-
-    print(f"Training configuration saved to: {config_path}")
-
-
-def find_latest_checkpoint(model_dir, model_type="uhved"):
-    """Find the latest checkpoint in the model directory."""
-    checkpoints = glob.glob(os.path.join(model_dir, f"{model_type}_*_epoch_*.pth"))
-    if not checkpoints:
-        return None
-
-    # Sort by epoch number
-    def get_epoch(path):
-        try:
-            return int(path.split('epoch_')[-1].split('.pth')[0])
-        except:
-            return -1
-
-    checkpoints.sort(key=get_epoch)
-    return checkpoints[-1] if checkpoints else None
-
-
-def save_model_checkpoint(filepath, model, optimizer, epoch, loss, val_loss=None,
-                          model_type="uhved", model_config=None, scheduler_state_dict=None):
-    """Save model checkpoint."""
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-        'val_loss': val_loss,
-        'model_type': model_type,
-        'model_config': model_config or {},
-    }
-
-    if scheduler_state_dict:
-        checkpoint['scheduler_state_dict'] = scheduler_state_dict
-
-    torch.save(checkpoint, filepath)
+from src.utils import (
+    save_model_checkpoint,
+    get_image_paths,
+    save_training_config,
+    find_latest_checkpoint,
+    calculate_metrics,
+    sliding_window_inference,
+    print_model_statistics,
+)
 
 
 def train_uhved_model(
@@ -198,9 +78,18 @@ def train_uhved_model(
     mixed_precision: str = "no",
     gradient_accumulation_steps: int = 1,
     seed: int = 42,
-    kl_weight: float = 0.001,
-    perceptual_weight: float = 0.0,
-    modality_weight: float = 0.5,
+    recon_loss_type: str = "l1",
+    recon_weight: float = 0.4,
+    kl_weight: float = 0.1,
+    perceptual_weight: float = 0.1,
+    ssim_weight: float = 0.1,
+    modality_weight: float = 0.4,
+    use_perceptual: bool = False,
+    use_ssim: bool = True,
+    perceptual_backend: str = 'medicalnet',
+    use_sliding_window_val: bool = False,
+    val_patch_size: tuple = (128, 128, 128),
+    val_overlap: float = 0.5,
 ):
     """
     Train U-HVED model with orthogonal LR stacks
@@ -238,9 +127,18 @@ def train_uhved_model(
         mixed_precision: Mixed precision training ('no', 'fp16', 'bf16')
         gradient_accumulation_steps: Number of steps to accumulate gradients
         seed: Random seed for reproducibility
+        recon_loss_type: Type of reconstruction loss ('l1', 'l2', or 'charbonnier')
+        recon_weight: Weight for reconstruction loss
         kl_weight: Weight for KL divergence loss
         perceptual_weight: Weight for perceptual loss
+        ssim_weight: Weight for SSIM loss
         modality_weight: Weight for modality reconstruction loss
+        use_perceptual: Whether to use perceptual loss
+        use_ssim: Whether to use SSIM loss
+        perceptual_backend: Backend for perceptual loss ('medicalnet' or 'monai', 'models_genesis')
+        use_sliding_window_val: Use sliding window inference for validation
+        val_patch_size: Patch size for sliding window validation
+        val_overlap: Overlap ratio for sliding window validation
     """
     # Initialize Accelerator for multi-GPU training
     accelerator = Accelerator(
@@ -401,15 +299,19 @@ def train_uhved_model(
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     criterion = UHVEDLoss(
-        reconstruction_weight=1.0,
+        recon_loss_type=recon_loss_type,
+        recon_weight=recon_weight,
         kl_weight=kl_weight,
         perceptual_weight=perceptual_weight,
+        ssim_weight=ssim_weight,
         modality_weight=modality_weight,
-        use_perceptual=perceptual_weight > 0,
+        use_perceptual=use_perceptual,
+        use_ssim=use_ssim,
+        perceptual_backend=perceptual_backend,
     )
 
     if accelerator.is_main_process:
-        print(f"Loss weights: recon=1.0, kl={kl_weight}, perceptual={perceptual_weight}, modality={modality_weight}")
+        print(f"Loss weights: recon={recon_weight}, kl={kl_weight}, perceptual={perceptual_weight}, modality={modality_weight}")
 
     # Calculate total training steps for scheduler
     num_steps = len(dataloader) * epochs
@@ -441,10 +343,24 @@ def train_uhved_model(
         val_dataloader = accelerator.prepare(val_dataloader)
 
     if accelerator.is_main_process:
-        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-        print(f"Training for {epochs} epochs, batch size {batch_size}")
+        # Print detailed model statistics including memory usage
+        # U-HVED expects 3 orthogonal stacks: [axial, coronal, sagittal]
+        input_shapes = [
+            (batch_size, 1, *output_shape),  # Axial stack
+            (batch_size, 1, *output_shape),  # Coronal stack
+            (batch_size, 1, *output_shape),  # Sagittal stack
+        ]
+        print_model_statistics(accelerator.unwrap_model(model), input_shapes, device=str(accelerator.device))
+        print(f"\nTraining for {epochs} epochs, batch size {batch_size}")
         print(f"Initial learning rate: {learning_rate}")
         print(f"Device: {accelerator.device}")
+
+    # Track best validation loss for saving best model
+    best_val_loss = float('inf')
+    if checkpoint_data is not None and 'val_loss' in checkpoint_data and checkpoint_data['val_loss'] is not None:
+        best_val_loss = checkpoint_data['val_loss']
+        if accelerator.is_main_process:
+            print(f"Best validation loss from checkpoint: {best_val_loss:.4f}")
 
     # Initialize Weights & Biases if enabled
     if use_wandb and accelerator.is_main_process:
@@ -483,9 +399,10 @@ def train_uhved_model(
         csv_filename = f"training_log_{timestamp}.csv"
         csv_path = os.path.join(model_dir, csv_filename)
 
-        csv_headers = ["epoch", "train_loss", "train_recon", "train_kl", "learning_rate", "epoch_time"]
+        csv_headers = ["epoch", "train_loss", "train_recon", "train_kl", "train_ssim", "train_perceptual", "train_modality",
+                        "learning_rate", "epoch_time"]
         if val_dataloader:
-            csv_headers.extend(["val_loss", "val_mae", "val_psnr", "validation_time"])
+            csv_headers.extend(["val_loss", "val_mae", "val_mse", "val_rmse", "val_psnr", "val_r2", "val_ssim", "validation_time"])
 
         csv_file = open(csv_path, mode='a', newline='')
         csv_writer = csv.DictWriter(csv_file, fieldnames=csv_headers)
@@ -500,8 +417,17 @@ def train_uhved_model(
         epoch_loss = 0.0
         epoch_recon_loss = 0.0
         epoch_kl_loss = 0.0
+        epoch_ssim_loss = 0.0
+        epoch_perceptual_loss = 0.0
+        epoch_modality_loss = 0.0
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}", disable=not accelerator.is_main_process)
+        pbar = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch + 1}/{epochs}",
+            disable=not accelerator.is_main_process,
+            leave=False,  # Don't leave progress bar after completion
+            dynamic_ncols=True,  # Adjust width dynamically
+        )
 
         for batch_idx, batch_data in enumerate(pbar):
             # Unpack batch: (lr_stacks_list, hr, resolutions_list, thicknesses_list)
@@ -545,6 +471,9 @@ def train_uhved_model(
             epoch_loss += loss.item()
             epoch_recon_loss += losses['reconstruction'].item()
             epoch_kl_loss += losses['kl'].item()
+            epoch_ssim_loss += losses['ssim'].item() if 'ssim' in losses else 0.0
+            epoch_perceptual_loss += losses['perceptual'].item() if 'perceptual' in losses else 0.0
+            epoch_modality_loss += losses['modality'].item() if 'modality' in losses else 0.0
 
             # Update progress bar
             current_lr = optimizer.param_groups[0]['lr']
@@ -552,12 +481,18 @@ def train_uhved_model(
                 "loss": f"{loss.item():.4f}",
                 "recon": f"{losses['reconstruction'].item():.4f}",
                 "kl": f"{losses['kl'].item():.4f}",
+                "ssim": f"{losses['ssim'].item():.4f}" if 'ssim' in losses else "N/A",
+                "perceptual": f"{losses['perceptual'].item():.4f}" if 'perceptual' in losses else "N/A",
+                "modality": f"{losses['modality'].item():.4f}" if 'modality' in losses else "N/A",
                 "lr": f"{current_lr:.2e}"
             })
 
         avg_loss = epoch_loss / len(dataloader)
         avg_recon = epoch_recon_loss / len(dataloader)
         avg_kl = epoch_kl_loss / len(dataloader)
+        avg_ssim = epoch_ssim_loss / len(dataloader) if epoch_ssim_loss > 0 else 0.0
+        avg_perceptual = epoch_perceptual_loss / len(dataloader) if epoch_perceptual_loss > 0 else 0.0
+        avg_modality = epoch_modality_loss / len(dataloader) if epoch_modality_loss > 0 else 0.0
 
         # Validation
         val_loss = None
@@ -568,7 +503,7 @@ def train_uhved_model(
             val_start_time = time.time()
             model.eval()
             val_epoch_loss = 0.0
-            metrics_sum = {"mae": 0.0, "mse": 0.0, "psnr": 0.0}
+            metrics_sum = {"mae": 0.0, "mse": 0.0, "rmse": 0.0, "psnr": 0.0, "r2": 0.0, "ssim": 0.0}
             num_val_batches = 0
 
             with torch.no_grad():
@@ -577,7 +512,22 @@ def train_uhved_model(
                     modalities = [m.float() for m in lr_stacks_list]
                     target_img = target_img.float()
 
-                    outputs = model(modalities)
+                    # Use sliding window inference if enabled
+                    if use_sliding_window_val:
+                        # For sliding window, process on main device
+                        sr_output = sliding_window_inference(
+                            model=accelerator.unwrap_model(model),
+                            modalities=modalities,
+                            patch_size=val_patch_size,
+                            overlap=val_overlap,
+                            batch_size=1,
+                            device=accelerator.device,
+                            blend_mode="gaussian",
+                            progress=False,
+                        )
+                        outputs = {'sr_output': sr_output, 'posteriors': None}
+                    else:
+                        outputs = model(modalities)
 
                     losses = criterion(
                         sr_output=outputs['sr_output'],
@@ -599,22 +549,23 @@ def train_uhved_model(
             validation_time = time.time() - val_start_time
 
             epoch_time = time.time() - epoch_start_time
-            if accelerator.is_main_process:
-                print(
-                    f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_loss:.4f} "
-                    f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}) - Val Loss: {val_loss:.4f}"
-                )
-                print(
-                    f"  Val Metrics - MAE: {val_metrics['mae']:.4f} | "
-                    f"PSNR: {val_metrics['psnr']:.2f} dB | LR: {current_lr:.2e}"
-                )
+            # Print validation results (use accelerator.print to avoid tqdm interference)
+            accelerator.print(
+                f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_loss:.4f} "
+                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, Modality: {avg_modality:.4f}) - Val Loss: {val_loss:.4f}"
+            )
+            accelerator.print(
+                f"  Val Metrics - MAE: {val_metrics['mae']:.4f} | RMSE: {val_metrics['rmse']:.4f} | "
+                f"PSNR: {val_metrics['psnr']:.2f} dB | SSIM: {val_metrics['ssim']:.4f} | "
+                f"R²: {val_metrics['r2']:.4f} | LR: {current_lr:.2e}"
+            )
         else:
             epoch_time = time.time() - epoch_start_time
-            if accelerator.is_main_process:
-                print(
-                    f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f} "
-                    f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}) - LR: {current_lr:.2e}"
-                )
+            # Print training summary (use accelerator.print to avoid tqdm interference)
+            accelerator.print(
+                f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f} "
+                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, Modality: {avg_modality:.4f}) - LR: {current_lr:.2e}"
+            )
 
         # Log to CSV
         if accelerator.is_main_process and csv_writer is not None:
@@ -623,6 +574,9 @@ def train_uhved_model(
                 "train_loss": avg_loss,
                 "train_recon": avg_recon,
                 "train_kl": avg_kl,
+                "train_ssim": avg_ssim,
+                "train_perceptual": avg_perceptual,
+                "train_modality": avg_modality,
                 "learning_rate": current_lr,
                 "epoch_time": epoch_time,
             }
@@ -630,7 +584,11 @@ def train_uhved_model(
                 log_data.update({
                     "val_loss": val_loss,
                     "val_mae": val_metrics['mae'],
+                    "val_mse": val_metrics['mse'],
+                    "val_rmse": val_metrics['rmse'],
                     "val_psnr": val_metrics['psnr'],
+                    "val_r2": val_metrics['r2'],
+                    "val_ssim": val_metrics['ssim'],
                     "validation_time": validation_time,
                 })
             csv_writer.writerow(log_data)
@@ -643,15 +601,62 @@ def train_uhved_model(
                 "train/loss": avg_loss,
                 "train/reconstruction": avg_recon,
                 "train/kl": avg_kl,
+                "train/ssim": avg_ssim,
+                "train/perceptual": avg_perceptual,
+                "train/modality": avg_modality,
                 "train/learning_rate": current_lr,
             }
             if val_loss is not None and val_metrics is not None:
                 wandb_log_data.update({
                     "val/loss": val_loss,
                     "val/mae": val_metrics['mae'],
+                    "val/mse": val_metrics['mse'],
+                    "val/rmse": val_metrics['rmse'],
                     "val/psnr": val_metrics['psnr'],
+                    "val/r2": val_metrics['r2'],
+                    "val/ssim": val_metrics['ssim'],
                 })
             wandb.log(wandb_log_data)
+
+        # Save best model if validation loss improved
+        if val_loss is not None and val_loss < best_val_loss:
+            best_val_loss = val_loss
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                best_model_path = os.path.join(model_dir, "uhved_orthogonal_best.pth")
+
+                model_config = {
+                    "model_architecture": "uhved",
+                    "num_modalities": 3,
+                    "base_channels": base_channels,
+                    "num_scales": num_scales,
+                    "output_shape": output_shape,
+                }
+
+                training_config = {
+                    "learning_rate": learning_rate,
+                    "kl_weight": kl_weight,
+                    "recon_weight": recon_weight,
+                    "ssim_weight": ssim_weight,
+                    "perceptual_weight": perceptual_weight,
+                    "modality_weight": modality_weight,
+                }
+
+                unwrapped_model = accelerator.unwrap_model(model)
+                save_model_checkpoint(
+                    filepath=best_model_path,
+                    model=unwrapped_model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    loss=avg_loss,
+                    val_loss=val_loss,
+                    model_type="uhved",
+                    model_config=model_config,
+                    scheduler_state_dict=scheduler.state_dict(),
+                    val_metrics=val_metrics,
+                    training_config=training_config,
+                )
+                accelerator.print(f"✓ Saved best model (val_loss: {val_loss:.4f}): {best_model_path}")
 
         # Save checkpoint
         if (epoch + 1) % save_interval == 0:
@@ -669,6 +674,13 @@ def train_uhved_model(
                     "output_shape": output_shape,
                 }
 
+                training_config = {
+                    "learning_rate": learning_rate,
+                    "kl_weight": kl_weight,
+                    "perceptual_weight": perceptual_weight,
+                    "modality_weight": modality_weight,
+                }
+
                 unwrapped_model = accelerator.unwrap_model(model)
                 save_model_checkpoint(
                     filepath=checkpoint_path,
@@ -680,8 +692,10 @@ def train_uhved_model(
                     model_type="uhved",
                     model_config=model_config,
                     scheduler_state_dict=scheduler.state_dict(),
+                    val_metrics=val_metrics,
+                    training_config=training_config,
                 )
-                print(f"Saved checkpoint: {checkpoint_path}")
+                accelerator.print(f"Saved checkpoint: {checkpoint_path}")
 
     # Close CSV file
     if accelerator.is_main_process and csv_file is not None:
@@ -699,17 +713,30 @@ def train_uhved_model(
             "output_shape": output_shape,
         }
 
+        training_config = {
+            "learning_rate": learning_rate,
+            "kl_weight": kl_weight,
+            "perceptual_weight": perceptual_weight,
+            "modality_weight": modality_weight,
+        }
+
         unwrapped_model = accelerator.unwrap_model(model)
         save_model_checkpoint(
             filepath=final_path,
             model=unwrapped_model,
             optimizer=optimizer,
             epoch=epochs - 1,
+            loss=avg_loss,
+            val_loss=val_loss,
             model_type="uhved",
             model_config=model_config,
             scheduler_state_dict=scheduler.state_dict(),
+            val_metrics=val_metrics,
+            training_config=training_config,
         )
         print(f"Training complete! Final model saved to: {final_path}")
+        if best_val_loss < float('inf'):
+            print(f"Best validation loss: {best_val_loss:.4f}")
 
         if use_wandb:
             artifact = wandb.Artifact(
@@ -739,6 +766,12 @@ if __name__ == "__main__":
     parser.add_argument("--base_dir", type=str, default=None, help="Base directory for CSV paths")
     parser.add_argument("--model_dir", type=str, required=True, help="Directory to save models")
     parser.add_argument("--val_image_dir", type=str, default=None, help="Validation images directory")
+    parser.add_argument("--mri_classes", type=str, nargs="+", default=None,
+                       help="MRI classifications to include (e.g., T1 T2 FLAIR). Only for CSV mode")
+    parser.add_argument("--acquisition_types", type=str, nargs="+", default=["3D"],
+                       help="Acquisition types to include (e.g., 3D 2D). Use 'all' for all types. Default: 3D only")
+    parser.add_argument("--no_filter_4d", action="store_true",
+                       help="Don't filter out 4D images (with time dimension)")
 
     # Model parameters
     parser.add_argument("--base_channels", type=int, default=32, help="Base channels for U-HVED")
@@ -751,18 +784,26 @@ if __name__ == "__main__":
     parser.add_argument("--output_shape", type=int, nargs=3, default=[128, 128, 128], help="Output shape")
 
     # Loss weights
-    parser.add_argument("--kl_weight", type=float, default=0.001, help="KL divergence weight")
-    parser.add_argument("--perceptual_weight", type=float, default=0.0, help="Perceptual loss weight")
-    parser.add_argument("--modality_weight", type=float, default=0.5, help="Modality reconstruction weight")
+    parser.add_argument("--recon_loss_type", type=str, default="l1", choices=["l1", "l2", "charbonnier"],
+                        help="Reconstruction loss type")
+    parser.add_argument("--recon_weight", type=float, default=0.4, help="Reconstruction loss weight")
+    parser.add_argument("--kl_weight", type=float, default=0.1, help="KL divergence weight")
+    parser.add_argument("--perceptual_weight", type=float, default=0.1, help="Perceptual loss weight")
+    parser.add_argument("--ssim_weight", type=float, default=0.1, help="SSIM loss weight")
+    parser.add_argument("--modality_weight", type=float, default=0.4, help="Modality reconstruction weight")
+    parser.add_argument("--use_perceptual", action="store_true", help="Use perceptual loss")
+    parser.add_argument("--use_ssim", action="store_true", help="Use SSIM loss")
+    parser.add_argument("--perceptual_backend", type=str, default="medicalnet",
+                        choices=["medicalnet", "monai", "models_genesis"], help="Perceptual loss backend")
 
     # Data generation parameters
     parser.add_argument("--atlas_res", type=float, nargs=3, default=[1.0, 1.0, 1.0], help="HR resolution")
     parser.add_argument("--min_resolution", type=float, nargs=3, default=[1.0, 1.0, 1.0], help="Min resolution")
     parser.add_argument("--max_res_aniso", type=float, nargs=3, default=[9.0, 9.0, 9.0], help="Max aniso resolution")
     parser.add_argument("--no_randomise_res", action="store_true", help="Disable resolution randomization")
-    parser.add_argument("--prob_motion", type=float, default=0.2, help="Probability of motion artifacts")
-    parser.add_argument("--prob_spike", type=float, default=0.05, help="Probability of k-space spikes")
-    parser.add_argument("--prob_aliasing", type=float, default=0.1, help="Probability of aliasing")
+    parser.add_argument("--prob_motion", type=float, default=0.5, help="Probability of motion artifacts")
+    parser.add_argument("--prob_spike", type=float, default=0.5, help="Probability of k-space spikes")
+    parser.add_argument("--prob_aliasing", type=float, default=0.02, help="Probability of aliasing")
     parser.add_argument("--prob_bias_field", type=float, default=0.5, help="Probability of bias field")
     parser.add_argument("--prob_noise", type=float, default=0.8, help="Probability of noise")
     parser.add_argument("--no_intensity_aug", action="store_true", help="Disable intensity augmentation")
@@ -772,6 +813,12 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint to resume from")
     parser.add_argument("--save_interval", type=int, default=10, help="Save every N epochs")
     parser.add_argument("--val_interval", type=int, default=1, help="Validate every N epochs")
+    parser.add_argument("--use_sliding_window_val", action="store_true",
+                       help="Use sliding window inference for validation (slower but more accurate for large volumes)")
+    parser.add_argument("--val_patch_size", type=int, nargs=3, default=[128, 128, 128],
+                       help="Patch size for sliding window validation")
+    parser.add_argument("--val_overlap", type=float, default=0.5,
+                       help="Overlap ratio for sliding window validation (0.0-1.0)")
     parser.add_argument("--num_workers", type=int, default=None, help="Number of workers")
     parser.add_argument("--use_cache", action="store_true", help="Use MONAI CacheDataset")
     parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases")
@@ -784,6 +831,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Process acquisition_types: convert "all" to None for the function
+    acquisition_types = args.acquisition_types
+    if acquisition_types and len(acquisition_types) == 1 and acquisition_types[0].lower() == "all":
+        acquisition_types = None
+
     # Get image paths
     hr_image_paths = get_image_paths(
         image_dir=args.hr_image_dir,
@@ -791,6 +843,9 @@ if __name__ == "__main__":
         base_dir=args.base_dir,
         split="train",
         model_dir=args.model_dir,
+        mri_classifications=args.mri_classes,
+        acquisition_types=acquisition_types,
+        filter_4d=not args.no_filter_4d,
     )
 
     val_image_paths = None
@@ -801,6 +856,9 @@ if __name__ == "__main__":
             base_dir=args.base_dir,
             split="val",
             model_dir=args.model_dir,
+            mri_classifications=args.mri_classes,
+            acquisition_types=acquisition_types,
+            filter_4d=not args.no_filter_4d,
         )
 
     # Create model directory
@@ -849,7 +907,16 @@ if __name__ == "__main__":
         mixed_precision=args.mixed_precision,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         seed=args.seed,
+        recon_loss_type=args.recon_loss_type,
+        recon_weight=args.recon_weight,
         kl_weight=args.kl_weight,
         perceptual_weight=args.perceptual_weight,
+        ssim_weight=args.ssim_weight,
         modality_weight=args.modality_weight,
+        use_perceptual=args.use_perceptual,
+        use_ssim=args.use_ssim,
+        perceptual_backend=args.perceptual_backend,
+        use_sliding_window_val=args.use_sliding_window_val,
+        val_patch_size=tuple(args.val_patch_size),
+        val_overlap=args.val_overlap,
     )

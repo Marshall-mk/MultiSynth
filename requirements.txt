@@ -2,6 +2,7 @@ torch
 torchvision
 tensorboard
 numpy
+nibabel
 Pillow
 torchviz
 graphviz
@@ -10,3 +11,8 @@ monai
 transformers
 accelerate
 tqdm
+einops
+# Optional dependencies for visualization
+scipy
+matplotlib
+streamlit

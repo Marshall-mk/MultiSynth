@@ -18,23 +18,24 @@ from pathlib import Path
 from src import UHVED, UHVEDLite, UHVEDWithUpscale, create_uhved
 
 
-def create_sample_inputs(num_modalities=3, in_channels=1, height=64, width=64, batch_size=1):
+def create_sample_inputs(num_modalities=3, in_channels=1, depth=64, height=64, width=64, batch_size=1):
     """
     Create sample input tensors for the model.
 
     Args:
         num_modalities: Number of input modalities
         in_channels: Number of channels per modality
+        depth: Input depth (3D dimension)
         height: Input height
         width: Input width
         batch_size: Batch size
 
     Returns:
-        List of input tensors, one per modality
+        List of input tensors, one per modality (B, C, D, H, W)
     """
     modalities = []
     for _ in range(num_modalities):
-        modality = torch.randn(batch_size, in_channels, height, width)
+        modality = torch.randn(batch_size, in_channels, depth, height, width)
         modalities.append(modality)
     return modalities
 
@@ -58,16 +59,16 @@ def visualize_uhved_config(config_name, output_dir="architecture_plots"):
     # Create model based on configuration
     if config_name == "default":
         model = create_uhved("default")
-        input_size = (64, 64)
+        input_size = (64, 64, 64)
     elif config_name == "lite":
         model = create_uhved("lite")
-        input_size = (64, 64)
+        input_size = (64, 64, 64)
     elif config_name == "sr2x":
         model = create_uhved("sr2x")
-        input_size = (64, 64)
+        input_size = (64, 64, 64)
     elif config_name == "sr4x":
         model = create_uhved("sr4x")
-        input_size = (64, 64)
+        input_size = (64, 64, 64)
     elif config_name == "custom":
         # Custom configuration example
         model = UHVED(
@@ -80,7 +81,7 @@ def visualize_uhved_config(config_name, output_dir="architecture_plots"):
             share_decoder=True,
             reconstruct_modalities=False
         )
-        input_size = (64, 64)
+        input_size = (64, 64, 64)
     else:
         raise ValueError(f"Unknown configuration: {config_name}")
 
@@ -98,14 +99,15 @@ def visualize_uhved_config(config_name, output_dir="architecture_plots"):
     num_modalities = 3
     in_channels = 1
 
-    print(f"Input shape per modality: (1, {in_channels}, {input_size[0]}, {input_size[1]})")
+    print(f"Input shape per modality: (1, {in_channels}, {input_size[0]}, {input_size[1]}, {input_size[2]})")
     print(f"Number of modalities: {num_modalities}")
 
     modalities = create_sample_inputs(
         num_modalities=num_modalities,
         in_channels=in_channels,
-        height=input_size[0],
-        width=input_size[1],
+        depth=input_size[0],
+        height=input_size[1],
+        width=input_size[2],
         batch_size=1
     )
 

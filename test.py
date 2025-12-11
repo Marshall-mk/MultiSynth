@@ -87,25 +87,25 @@ def load_uhved_from_checkpoint(checkpoint_path, device="cuda"):
 
     # Extract model configuration
     model_config = checkpoint.get('model_config', {})
-    num_modalities = model_config.get('num_modalities', 3)
+    num_orientations = model_config.get('num_orientations', 3)
     base_channels = model_config.get('base_channels', 32)
     num_scales = model_config.get('num_scales', 4)
 
     print(f"Model configuration:")
-    print(f"  - Modalities: {num_modalities}")
+    print(f"  - orientations: {num_orientations}")
     print(f"  - Base channels: {base_channels}")
     print(f"  - Scales: {num_scales}")
 
     # Create model
     model = UHVED(
-        num_modalities=num_modalities,
+        num_orientations=num_orientations,
         in_channels=1,
         out_channels=1,
         base_channels=base_channels,
         num_scales=num_scales,
         share_encoder=False,
         share_decoder=False,
-        reconstruct_modalities=False,  # Disable for inference
+        reconstruct_orientations=False,  # Disable for inference
     )
 
     # Load weights
@@ -359,7 +359,7 @@ def predict_single_volume(
             print(f"  Running sliding window inference (patch: {patch_size}, overlap: {overlap})...")
             sr_output = sliding_window_inference(
                 model=model,
-                modalities=lr_stacks_padded,
+                orientations=lr_stacks_padded,
                 patch_size=patch_size,
                 overlap=overlap,
                 batch_size=1,

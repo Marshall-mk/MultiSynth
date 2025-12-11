@@ -669,7 +669,7 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
         # Training stage and architecture
         'training_stage': training_stage,
         'model_architecture': 'uhved',
-        'num_modalities': 3,  # Fixed: axial, coronal, sagittal
+        'num_orientations': 3,  # Fixed: axial, coronal, sagittal
 
         # Dataset info
         'n_train_samples': n_train_samples,
@@ -697,7 +697,7 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
         # Loss weights
         'kl_weight': args.kl_weight,
         'perceptual_weight': args.perceptual_weight,
-        'modality_weight': args.modality_weight,
+        'orientation_weight': args.orientation_weight,
 
         # Artifact probabilities
         'prob_motion': args.prob_motion,
@@ -783,39 +783,41 @@ def calculate_metrics(pred: torch.Tensor, target: torch.Tensor, max_val: float =
 
 def sliding_window_inference(
     model: nn.Module,
-    modalities: list,
+    orientations: list,
     patch_size: tuple = (128, 128, 128),
     overlap: float = 0.5,
     batch_size: int = 1,
     device: str = "cuda",
     blend_mode: str = "gaussian",
     progress: bool = False,
+    orientation_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Perform sliding window inference for U-HVED with multiple input modalities.
+    Perform sliding window inference for U-HVED with multiple input orientations.
 
     Args:
         model: U-HVED model for inference (should be in eval mode)
-        modalities: List of 3 input volumes (orthogonal stacks), each (1, C, D, H, W) or (C, D, H, W)
+        orientations: List of 3 input volumes (orthogonal stacks), each (1, C, D, H, W) or (C, D, H, W)
         patch_size: Size of patches for inference (D, H, W)
         overlap: Overlap ratio between adjacent patches [0, 1)
         batch_size: Number of patches to process simultaneously (typically 1 for U-HVED)
         device: Device for inference ('cuda' or 'cpu')
         blend_mode: Method for blending overlapping patches ('gaussian' or 'constant')
         progress: If True, show progress bar
+        orientation_mask: Optional boolean tensor (B, 3) indicating which orientations are present
 
     Returns:
-        Predicted SR volume of same shape as input modalities (1, C, D, H, W) or (C, D, H, W)
+        Predicted SR volume of same shape as input orientations (1, C, D, H, W) or (C, D, H, W)
 
     Example:
         >>> model.eval()
         >>> lr_axial = torch.randn(1, 1, 128, 128, 128).cuda()
         >>> lr_coronal = torch.randn(1, 1, 128, 128, 128).cuda()
         >>> lr_sagittal = torch.randn(1, 1, 128, 128, 128).cuda()
-        >>> modalities = [lr_axial, lr_coronal, lr_sagittal]
+        >>> orientations = [lr_axial, lr_coronal, lr_sagittal]
         >>> sr_output = sliding_window_inference(
         ...     model=model,
-        ...     modalities=modalities,
+        ...     orientations=orientations,
         ...     patch_size=(128, 128, 128),
         ...     overlap=0.5,
         ...     device="cuda"
@@ -827,14 +829,14 @@ def sliding_window_inference(
     model.eval()
 
     # Validate inputs
-    if len(modalities) != 3:
-        raise ValueError(f"U-HVED requires exactly 3 input modalities, got {len(modalities)}")
+    if len(orientations) != 3:
+        raise ValueError(f"U-HVED requires exactly 3 input orientations, got {len(orientations)}")
 
     # Handle input shapes and normalize
-    normalized_modalities = []
+    normalized_orientations = []
     squeeze_output = False
 
-    for i, volume in enumerate(modalities):
+    for i, volume in enumerate(orientations):
         if volume.ndim == 4:
             volume = volume.unsqueeze(0)  # Add batch dimension
             if i == 0:  # Only set flag once
@@ -846,13 +848,13 @@ def sliding_window_inference(
 
         # Move to device
         volume = volume.to(device)
-        normalized_modalities.append(volume)
+        normalized_orientations.append(volume)
 
     # Create a wrapper predictor that takes a single stacked input
     # and splits it for the U-HVED model
     def uhved_predictor(stacked_input):
-        """Predictor that splits stacked input into modalities for U-HVED."""
-        # Split the stacked input back into 3 modalities
+        """Predictor that splits stacked input into orientations for U-HVED."""
+        # Split the stacked input back into 3 orientations
         batch_size = stacked_input.shape[0]
         channels = stacked_input.shape[1] // 3
 
@@ -860,10 +862,10 @@ def sliding_window_inference(
         mod2 = stacked_input[:, channels:channels*2]
         mod3 = stacked_input[:, channels*2:]
 
-        # Create list of modalities for each batch item
-        batch_modalities = []
+        # Create list of orientations for each batch item
+        batch_orientations = []
         for b in range(batch_size):
-            batch_modalities.append([
+            batch_orientations.append([
                 mod1[b:b+1],
                 mod2[b:b+1],
                 mod3[b:b+1]
@@ -871,9 +873,9 @@ def sliding_window_inference(
 
         # Process each item in batch
         outputs = []
-        for mods in batch_modalities:
+        for mods in batch_orientations:
             with torch.no_grad():
-                result = model(mods)
+                result = model(mods, orientation_mask=orientation_mask)
                 if isinstance(result, dict):
                     outputs.append(result['sr_output'])
                 else:
@@ -881,9 +883,9 @@ def sliding_window_inference(
 
         return torch.cat(outputs, dim=0)
 
-    # Stack modalities along channel dimension for sliding window
+    # Stack orientations along channel dimension for sliding window
     # This allows MONAI to handle the patching uniformly
-    stacked_input = torch.cat(normalized_modalities, dim=1)  # (1, 3*C, D, H, W)
+    stacked_input = torch.cat(normalized_orientations, dim=1)  # (1, 3*C, D, H, W)
 
     # Use MONAI's sliding window inference
     with torch.no_grad():

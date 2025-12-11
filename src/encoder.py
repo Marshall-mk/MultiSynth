@@ -1,6 +1,6 @@
 """
 Convolutional Encoder for U-HVED
-Each input modality is encoded independently, producing mu and logvar at multiple scales.
+Each input orientation is encoded independently, producing mu and logvar at multiple scales.
 """
 
 import torch
@@ -116,7 +116,7 @@ class ConvEncoder(nn.Module):
     """
     Multi-scale convolutional encoder for U-HVED.
 
-    Encodes a single modality and produces variational parameters (mu, logvar)
+    Encodes a single orientation and produces variational parameters (mu, logvar)
     at multiple spatial scales for hierarchical latent representation.
 
     Architecture:
@@ -134,7 +134,7 @@ class ConvEncoder(nn.Module):
     ):
         """
         Args:
-            in_channels: Number of input channels per modality
+            in_channels: Number of input channels per orientation
             base_channels: Base number of channels (doubles at each scale)
             num_scales: Number of encoding scales (default 4)
             activation: Activation function type
@@ -202,9 +202,9 @@ class ConvEncoder(nn.Module):
 
 class MultiModalEncoder(nn.Module):
     """
-    Wrapper that creates independent encoders for multiple input modalities.
+    Wrapper that creates independent encoders for multiple input orientations.
 
-    For super-resolution, modalities can be:
+    For super-resolution, orientations can be:
     - Different degradation types (blur, noise, downsampling)
     - Different scale factors
     - Different image representations
@@ -212,7 +212,7 @@ class MultiModalEncoder(nn.Module):
 
     def __init__(
         self,
-        num_modalities: int = 4,
+        num_orientations: int = 4,
         in_channels: int = 1,
         base_channels: int = 32,
         num_scales: int = 4,
@@ -221,16 +221,16 @@ class MultiModalEncoder(nn.Module):
     ):
         """
         Args:
-            num_modalities: Number of input modalities
-            in_channels: Channels per modality
+            num_orientations: Number of input orientations
+            in_channels: Channels per orientation
             base_channels: Base channel count
             num_scales: Number of encoding scales
-            share_weights: If True, all modalities share the same encoder
+            share_weights: If True, all orientations share the same encoder
             activation: Activation function
         """
         super().__init__()
 
-        self.num_modalities = num_modalities
+        self.num_orientations = num_orientations
         self.share_weights = share_weights
         self.num_scales = num_scales
 
@@ -239,29 +239,30 @@ class MultiModalEncoder(nn.Module):
             self.encoder = ConvEncoder(in_channels, base_channels, num_scales, activation)
             self.hidden_dims = self.encoder.hidden_dims
         else:
-            # Independent encoder per modality
+            # Independent encoder per orientation
             self.encoders = nn.ModuleList([
                 ConvEncoder(in_channels, base_channels, num_scales, activation)
-                for _ in range(num_modalities)
+                for _ in range(num_orientations)
             ])
             self.hidden_dims = self.encoders[0].hidden_dims
 
     def forward(
         self,
-        modalities: List[torch.Tensor],
-        modality_mask: Optional[torch.Tensor] = None
+        orientations: List[torch.Tensor],
+        orientation_mask: Optional[torch.Tensor] = None
     ) -> List[Dict[str, Dict[int, torch.Tensor]]]:
         """
-        Encode all modalities.
+        Encode all orientations.
 
         Args:
-            modalities: List of tensors, one per modality
-            modality_mask: Boolean tensor of shape (num_modalities,) indicating
-                          which modalities are present
+            orientations: List of tensors, one per orientation
+            orientation_mask: Boolean tensor indicating which orientations are present
+                          - Shape (num_orientations,): same mask for all batch elements
+                          - Shape (B, num_orientations): different mask per batch element
 
         Returns:
             List (per scale) of dicts containing 'mu' and 'logvar' dicts
-            mapping modality index to tensor
+            mapping orientation index to tensor
         """
         # Initialize output structure
         scale_outputs = [
@@ -269,12 +270,17 @@ class MultiModalEncoder(nn.Module):
             for _ in range(self.num_scales)
         ]
 
-        for mod_idx, mod_input in enumerate(modalities):
-            # Skip if modality is masked out
-            if modality_mask is not None and not modality_mask[mod_idx]:
-                continue
+        # Determine if mask is batched
+        mask_is_batched = orientation_mask is not None and orientation_mask.dim() == 2
 
-            # Get encoder for this modality
+        for mod_idx, mod_input in enumerate(orientations):
+            # For global masks (1D), skip entirely if masked out
+            # For batched masks (2D), encode all orientations - fusion will handle per-batch masking
+            if orientation_mask is not None and not mask_is_batched:
+                if not orientation_mask[mod_idx]:
+                    continue
+
+            # Get encoder for this orientation
             if self.share_weights:
                 encoder = self.encoder
             else:

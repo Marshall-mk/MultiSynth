@@ -1,5 +1,5 @@
 """
-Data loading and generation for SynthSR training.
+Data loading and generation for MultiSynthSR training.
 Includes comprehensive k-space artifact simulation and Physics-based PSF blurring.
 
 This module simulates the MRI acquisition pipeline to generate synthetic Low-Resolution (LR) images
@@ -177,7 +177,7 @@ class SliceProfilePhysics(nn.Module):
                 img_in = img # (C, D, H, W) is already fine for W if flattened differently?
                 # Actually conv1d operates on the last dim.
                 # So for W, we need input (C, D, H, W) -> flatten -> (Batch, C, W)
-                img_in = img.permute(0, 1, 2, 3) # No change needed relative to "last dim" logic
+                img_in = img.permute(0, 1, 2, 3) 
             
             # Flatten non-active dims into batch
             shape_before = img_in.shape
@@ -195,7 +195,7 @@ class SliceProfilePhysics(nn.Module):
             elif i == 1:
                 img = img_out.permute(0, 1, 3, 2)
             else:
-                img = img_out # Already correct
+                img = img_out 
                 
         return img
 
@@ -641,10 +641,10 @@ class MRIArtifactSimulator(torch.nn.Module):
         image: torch.Tensor,
         acquisition_res: torch.Tensor,
         thickness: Optional[torch.Tensor] = None,
-        apply_motion: Optional[torch.Tensor] = None,
-        apply_spike: Optional[torch.Tensor] = None,
-        apply_aliasing: Optional[torch.Tensor] = None,
-        apply_noise: Optional[torch.Tensor] = None,
+        enable_motion: Optional[torch.Tensor] = None,
+        enable_spike: Optional[torch.Tensor] = None,
+        enable_aliasing: Optional[torch.Tensor] = None,
+        enable_noise: Optional[torch.Tensor] = None,
         motion_axis: Optional[torch.Tensor] = None,
         aliasing_axis: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -655,10 +655,10 @@ class MRIArtifactSimulator(torch.nn.Module):
             image: Input volume (B, C, D, H, W)
             acquisition_res: Resolution per batch (B, 3) or (3,)
             thickness: Slice thickness per batch (B, 3) or (3,)
-            apply_motion: Pre-sampled bool mask (B,) for motion artifacts
-            apply_spike: Pre-sampled bool mask (B,) for spike artifacts
-            apply_aliasing: Pre-sampled bool mask (B,) for aliasing
-            apply_noise: Pre-sampled bool mask (B,) for noise
+            enable_motion: Pre-sampled bool mask (B,) for motion artifacts
+            enable_spike: Pre-sampled bool mask (B,) for spike artifacts
+            enable_aliasing: Pre-sampled bool mask (B,) for aliasing
+            enable_noise: Pre-sampled bool mask (B,) for noise
             motion_axis: Pre-sampled axis (B,) for motion direction
             aliasing_axis: Pre-sampled axis (B,) for aliasing direction
 
@@ -689,8 +689,8 @@ class MRIArtifactSimulator(torch.nn.Module):
 
             # --- STEP 2: K-Space Artifacts (Motion / Spike) ---
             # Use pre-sampled decisions if provided, otherwise sample randomly
-            if apply_motion is not None:
-                should_apply_motion = apply_motion[b].item()
+            if enable_motion is not None:
+                should_apply_motion = enable_motion[b].item()
             else:
                 should_apply_motion = torch.rand(1).item() < self.prob_motion
 
@@ -701,8 +701,8 @@ class MRIArtifactSimulator(torch.nn.Module):
                     axis = torch.randint(1, 3, (1,)).item()
                 img = apply_kspace_motion_ghosting(img, axis=axis, intensity=self.motion_intensity)
 
-            if apply_spike is not None:
-                should_apply_spike = apply_spike[b].item()
+            if enable_spike is not None:
+                should_apply_spike = enable_spike[b].item()
             else:
                 should_apply_spike = torch.rand(1).item() < self.prob_spike
 
@@ -710,8 +710,8 @@ class MRIArtifactSimulator(torch.nn.Module):
                 img = apply_kspace_spike(img, intensity=self.spike_intensity)
 
             # --- STEP 3: Aliasing ---
-            if apply_aliasing is not None:
-                should_apply_aliasing = apply_aliasing[b].item()
+            if enable_aliasing is not None:
+                should_apply_aliasing = enable_aliasing[b].item()
             else:
                 should_apply_aliasing = torch.rand(1).item() < self.prob_aliasing
 
@@ -750,7 +750,7 @@ class MRIArtifactSimulator(torch.nn.Module):
                 cropped_fft = torch.fft.ifftshift(cropped_fft, dim=(1, 2, 3))
                 img = torch.real(torch.fft.ifftn(cropped_fft, dim=(1, 2, 3)))
 
-                # Upsample back (Nearest Neighbor) to maintain "Blocky/Stair-step" look
+                # Upsample back (Nearest Neighbor)
                 if list(img.shape[1:]) != self.output_shape:
                     img = torch.nn.functional.interpolate(
                         img.unsqueeze(0),
@@ -759,8 +759,8 @@ class MRIArtifactSimulator(torch.nn.Module):
                     ).squeeze(0)
 
             # --- STEP 5: Noise ---
-            if apply_noise is not None:
-                should_apply_noise = apply_noise[b].item()
+            if enable_noise is not None:
+                should_apply_noise = enable_noise[b].item()
             else:
                 should_apply_noise = self.prob_noise > 0 and torch.rand(1).item() < self.prob_noise
 
@@ -790,11 +790,11 @@ class HRLRDataGenerator:
         randomise_res: If True, randomize acquisition resolution
         apply_intensity_aug: If True, apply intensity augmentation to LR
         clip_to_unit_range: If True, clip outputs to [0, 1] range
-        modality_dropout_prob: Probability of applying modality dropout (0.0-1.0).
-                              When applied, randomly drops 1-2 modalities to simulate
-                              missing views during inference. Default: 0.0 (no dropout)
-        min_modalities: Minimum number of modalities to keep after dropout (1-3).
-                       Default: 1 (allows training with single views)
+        orientation_dropout_prob: Probability of applying orientation dropout (0.0-1.0).
+                                 When applied, randomly drops 1-2 orientations to simulate
+                                 missing views during inference. Default: 0.0 (no dropout)
+        min_orientations: Minimum number of orientations to keep after dropout (1-3).
+                         Default: 1 (allows training with single views)
     """
 
     def __init__(
@@ -815,9 +815,9 @@ class HRLRDataGenerator:
         # Toggles
         apply_intensity_aug: bool = True,
         clip_to_unit_range: bool = True,
-        # Modality dropout (for robust training with missing views)
-        modality_dropout_prob: float = 0.0,
-        min_modalities: int = 1,
+        # Orientation dropout (for robust training with missing views)
+        orientation_dropout_prob: float = 0.0,
+        min_orientations: int = 1,
     ):
         self.atlas_res = atlas_res
         self.target_res = target_res
@@ -828,9 +828,9 @@ class HRLRDataGenerator:
 
         self.prob_bias_field = prob_bias_field
 
-        # Modality dropout parameters
-        self.modality_dropout_prob = modality_dropout_prob
-        self.min_modalities = max(1, min(min_modalities, 3))  # Clamp to [1, 3]
+        # Orientation dropout parameters
+        self.orientation_dropout_prob = orientation_dropout_prob
+        self.min_orientations = max(1, min(min_orientations, 3))  # Clamp to [1, 3]
 
         # 1. Resolution Sampler
         if randomise_res:
@@ -881,36 +881,36 @@ class HRLRDataGenerator:
         """Normalize image to [0, 1] range using percentile scaling."""
         return self.normalizer(image)
 
-    def _create_modality_mask(self, batch_size: int, device: torch.device) -> torch.Tensor:
+    def _create_orientation_mask(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """
-        Create modality mask for dropout (simulating missing views).
+        Create orientation mask for dropout (simulating missing views).
 
         Args:
             batch_size: Number of volumes in batch
             device: Device to create tensors on
 
         Returns:
-            Boolean mask of shape (batch_size, 3) where True indicates modality is present.
-            Always ensures at least min_modalities are present per sample.
+            Boolean mask of shape (batch_size, 3) where True indicates orientation is present.
+            Always ensures at least min_orientations are present per sample.
         """
-        # Start with all modalities present
+        # Start with all orientations present
         mask = torch.ones(batch_size, 3, dtype=torch.bool, device=device)
 
         # Apply dropout with probability
-        if self.modality_dropout_prob > 0.0:
+        if self.orientation_dropout_prob > 0.0:
             for b in range(batch_size):
                 # Decide whether to apply dropout for this sample
-                if torch.rand(1).item() < self.modality_dropout_prob:
-                    # Randomly select how many modalities to keep
-                    # Keep between min_modalities and 3
+                if torch.rand(1).item() < self.orientation_dropout_prob:
+                    # Randomly select how many orientations to keep
+                    # Keep between min_orientations and 3
                     num_keep = torch.randint(
-                        self.min_modalities,
-                        4,  # Upper bound is exclusive, so this gives [min_modalities, 3]
+                        self.min_orientations,
+                        4,  # Upper bound is exclusive, so this gives [min_orientations, 3]
                         (1,)
                     ).item()
 
                     if num_keep < 3:
-                        # Randomly select which modalities to keep
+                        # Randomly select which orientations to keep
                         indices = torch.randperm(3)[:num_keep]
                         mask[b, :] = False
                         mask[b, indices] = True
@@ -1047,10 +1047,10 @@ class HRLRDataGenerator:
 
         Returns:
             If return_resolution=False:
-                (lr_stack_list, hr_augmented, modality_mask)
-                where lr_stack_list contains 3 LR volumes and modality_mask is (B, 3)
+                (lr_stack_list, hr_augmented, orientation_mask)
+                where lr_stack_list contains 3 LR volumes and orientation_mask is (B, 3)
             If return_resolution=True:
-                (lr_stack_list, hr_augmented, resolutions, thicknesses, modality_mask)
+                (lr_stack_list, hr_augmented, resolutions, thicknesses, orientation_mask)
         """
         batch_size = hr_images.shape[0]
         device = hr_images.device
@@ -1107,10 +1107,10 @@ class HRLRDataGenerator:
                 lr_images,
                 resolution,
                 thickness,
-                apply_motion=apply_motion,
-                apply_spike=apply_spike,
-                apply_aliasing=apply_aliasing,
-                apply_noise=apply_noise,
+                enable_motion=apply_motion,
+                enable_spike=apply_spike,
+                enable_aliasing=apply_aliasing,
+                enable_noise=apply_noise,
                 motion_axis=motion_axis,
                 aliasing_axis=aliasing_axis,
             )
@@ -1142,21 +1142,17 @@ class HRLRDataGenerator:
         # HR is already normalized by percentiles; clip tiny float drift
         hr_augmented = torch.clamp(hr_augmented, 0.0, 1.0)
 
-        # === STEP 6: APPLY MODALITY DROPOUT (if enabled) ===
-        # Create modality mask for simulating missing views
-        modality_mask = self._create_modality_mask(batch_size, device)
-
-        # Zero out dropped modalities
-        for stack_idx in range(3):
-            for b in range(batch_size):
-                if not modality_mask[b, stack_idx]:
-                    # Zero out this modality for this sample
-                    lr_stacks[stack_idx][b] = 0.0
+        # === STEP 6: CREATE ORIENTATION DROPOUT MASK (if enabled) ===
+        # Create orientation mask for simulating missing views
+        # The mask indicates which orientations are "present" for each sample
+        # This mask is passed to the fusion mechanism, which handles the dropout
+        # by excluding masked-out orientations from the Product of Gaussians fusion
+        orientation_mask = self._create_orientation_mask(batch_size, device)
 
         if return_resolution:
-            return lr_stacks, hr_augmented, resolutions, thicknesses, modality_mask
+            return lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask
         else:
-            return lr_stacks, hr_augmented, modality_mask
+            return lr_stacks, hr_augmented, orientation_mask
 
 
 # --- Dataset Wrappers ---
@@ -1192,23 +1188,23 @@ class GeneratorDataset(torch.utils.data.Dataset):
         )
 
         if self.return_resolution:
-            lr_stacks, hr_augmented, resolutions, thicknesses, modality_mask = result
+            lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask = result
             # lr_stacks is a list of 3 tensors, each (1, C, D, H, W)
-            # Return them as separate modalities
+            # Return them as separate orientations
             return (
-                [stack.squeeze(0) for stack in lr_stacks],  # List of 3 modalities
+                [stack.squeeze(0) for stack in lr_stacks],  # List of 3 orientations
                 hr_augmented.squeeze(0),  # HR ground truth
                 [res.squeeze(0) for res in resolutions],  # List of 3 resolution configs
                 [thick.squeeze(0) for thick in thicknesses],  # List of 3 thickness configs
-                modality_mask.squeeze(0)  # Modality mask (3,)
+                orientation_mask.squeeze(0)  # Orientation mask (3,)
             )
         else:
-            lr_stacks, hr_augmented, modality_mask = result
+            lr_stacks, hr_augmented, orientation_mask = result
             # Return the three LR stacks as a list
             return (
                 [stack.squeeze(0) for stack in lr_stacks],
                 hr_augmented.squeeze(0),
-                modality_mask.squeeze(0)
+                orientation_mask.squeeze(0)
             )
 
 

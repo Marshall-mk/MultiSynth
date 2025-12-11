@@ -7,17 +7,17 @@ PyTorch implementation adapted from:
 
 Key concept:
 The network forces the model to learn the same feature representation for
-different inputs (modalities) through:
-1. Independent encoding of each modality
+different inputs (orientations) through:
+1. Independent encoding of each orientation
 2. Product of Gaussians fusion in the latent space
 3. Shared decoder for reconstruction
 
-For super-resolution, modalities can represent:
+For super-resolution, orientations can represent:
 - Different degradation types (blur kernels, noise levels)
 - Different scale factors
 - Different representations of the same image
 
-The variational framework ensures a consistent latent space across modalities.
+The variational framework ensures a consistent latent space across orientations.
 """
 
 import torch
@@ -36,20 +36,20 @@ class UHVED(nn.Module):
     U-HVED: Hetero-Modal Variational Encoder-Decoder
 
     A variational autoencoder architecture that:
-    1. Encodes multiple input modalities independently
+    1. Encodes multiple input orientations independently
     2. Fuses their latent distributions via Product of Gaussians
     3. Samples from the fused posterior
     4. Decodes to produce super-resolved output
 
     The key innovation is the Product of Gaussians fusion which:
-    - Combines information from all available modalities
-    - Handles missing modalities gracefully
-    - Forces a shared latent representation across modalities
+    - Combines information from all available orientations
+    - Handles missing orientations gracefully
+    - Forces a shared latent representation across orientations
     """
 
     def __init__(
         self,
-        num_modalities: int = 4,
+        num_orientations: int = 4,
         in_channels: int = 1,
         out_channels: int = 1,
         base_channels: int = 32,
@@ -59,31 +59,31 @@ class UHVED(nn.Module):
         use_prior: bool = True,
         activation: str = 'leakyrelu',
         upsample_mode: str = 'trilinear',
-        reconstruct_modalities: bool = True
+        reconstruct_orientations: bool = True
     ):
         """
         Args:
-            num_modalities: Number of input modalities
-            in_channels: Channels per input modality
+            num_orientations: Number of input orientations
+            in_channels: Channels per input orientation
             out_channels: Output channels
             base_channels: Base channel count (doubles at each scale)
             num_scales: Number of hierarchical scales
-            share_encoder: Share encoder weights across modalities
-            share_decoder: Share decoder weights for modality reconstruction
+            share_encoder: Share encoder weights across orientations
+            share_decoder: Share decoder weights for orientation reconstruction
             use_prior: Include prior in Product of Gaussians
             activation: Activation function type
             upsample_mode: Upsampling strategy in decoder
-            reconstruct_modalities: Whether to reconstruct input modalities
+            reconstruct_orientations: Whether to reconstruct input orientations
         """
         super().__init__()
 
-        self.num_modalities = num_modalities
+        self.num_orientations = num_orientations
         self.num_scales = num_scales
-        self.reconstruct_modalities = reconstruct_modalities
+        self.reconstruct_orientations = reconstruct_orientations
 
         # Multi-modal encoder
         self.encoder = MultiModalEncoder(
-            num_modalities=num_modalities,
+            num_orientations=num_orientations,
             in_channels=in_channels,
             base_channels=base_channels,
             num_scales=num_scales,
@@ -98,9 +98,9 @@ class UHVED(nn.Module):
         )
 
         # Decoder(s)
-        if reconstruct_modalities:
+        if reconstruct_orientations:
             self.decoder = MultiOutputDecoder(
-                num_modalities=num_modalities,
+                num_orientations=num_orientations,
                 out_channels=out_channels,
                 base_channels=base_channels,
                 num_scales=num_scales,
@@ -122,40 +122,40 @@ class UHVED(nn.Module):
 
     def encode(
         self,
-        modalities: List[torch.Tensor],
-        modality_mask: Optional[torch.Tensor] = None
+        orientations: List[torch.Tensor],
+        orientation_mask: Optional[torch.Tensor] = None
     ) -> List[Dict[str, Dict[int, torch.Tensor]]]:
         """
-        Encode all modalities.
+        Encode all orientations.
 
         Args:
-            modalities: List of input tensors (one per modality)
-            modality_mask: Boolean mask for present modalities
+            orientations: List of input tensors (one per orientation)
+            orientation_mask: Boolean mask for present orientations
 
         Returns:
-            Multi-scale encoder outputs with mu/logvar per modality
+            Multi-scale encoder outputs with mu/logvar per orientation
         """
-        return self.encoder(modalities, modality_mask)
+        return self.encoder(orientations, orientation_mask)
 
     def fuse(
         self,
         encoder_outputs: List[Dict[str, Dict[int, torch.Tensor]]],
-        modality_mask: Optional[torch.Tensor] = None,
+        orientation_mask: Optional[torch.Tensor] = None,
         deterministic: bool = False
     ) -> Tuple[List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]]:
         """
-        Fuse encoded modalities via Product of Gaussians and sample.
+        Fuse encoded orientations via Product of Gaussians and sample.
 
         Args:
             encoder_outputs: Output from encoder
-            modality_mask: Boolean mask for present modalities
+            orientation_mask: Boolean mask for present orientations
             deterministic: If True, return mean without sampling
 
         Returns:
             samples: Multi-scale latent samples
             posteriors: Multi-scale (mu, logvar) for loss computation
         """
-        return self.fusion(encoder_outputs, modality_mask, deterministic)
+        return self.fusion(encoder_outputs, orientation_mask, deterministic)
 
     def decode(
         self,
@@ -170,67 +170,67 @@ class UHVED(nn.Module):
             encoder_outputs: Optional encoder outputs for skip connections
 
         Returns:
-            Super-resolved output (and modality reconstructions if enabled)
+            Super-resolved output (and orientation reconstructions if enabled)
         """
         # Extract skip features from encoder
         skip_features = None
         if encoder_outputs is not None:
-            # Use features from first available modality as skip
+            # Use features from first available orientation as skip
             skip_features = []
             for scale_data in encoder_outputs:
                 features = scale_data.get('features', {})
                 if features:
-                    # Average features across modalities
+                    # Average features across orientations
                     feat_list = list(features.values())
                     avg_feat = torch.stack(feat_list, dim=0).mean(dim=0)
                     skip_features.append(avg_feat)
 
-        if self.reconstruct_modalities:
-            return self.decoder(latent_samples, skip_features, reconstruct_modalities=True)
+        if self.reconstruct_orientations:
+            return self.decoder(latent_samples, skip_features, reconstruct_orientations=True)
         else:
             return self.decoder(latent_samples, skip_features)
 
     def forward(
         self,
-        modalities: List[torch.Tensor],
-        modality_mask: Optional[torch.Tensor] = None,
+        orientations: List[torch.Tensor],
+        orientation_mask: Optional[torch.Tensor] = None,
         deterministic: bool = False
     ) -> Dict[str, Union[torch.Tensor, List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]]]:
         """
         Full forward pass.
 
         Args:
-            modalities: List of input tensors (B, C, D, H, W) per modality
-            modality_mask: Boolean tensor indicating which modalities are present
+            orientations: List of input tensors (B, C, D, H, W) per orientation
+            orientation_mask: Boolean tensor indicating which orientations are present
             deterministic: If True, use mean instead of sampling
 
         Returns:
             Dictionary containing:
                 - 'sr_output': Super-resolved output
-                - 'modality_outputs': Reconstructed modalities (if enabled)
+                - 'orientation_outputs': Reconstructed orientations (if enabled)
                 - 'posteriors': List of (mu, logvar) at each scale
                 - 'latent_samples': Multi-scale latent samples
         """
         # Encode
-        encoder_outputs = self.encode(modalities, modality_mask)
+        encoder_outputs = self.encode(orientations, orientation_mask)
 
         # Fuse and sample
         latent_samples, posteriors = self.fuse(
             encoder_outputs,
-            modality_mask,
+            orientation_mask,
             deterministic or not self.training
         )
 
         # Decode
-        if self.reconstruct_modalities:
-            sr_output, modality_outputs = self.decode(latent_samples, encoder_outputs)
+        if self.reconstruct_orientations:
+            sr_output, orientation_outputs = self.decode(latent_samples, encoder_outputs)
         else:
             sr_output = self.decode(latent_samples, encoder_outputs)
-            modality_outputs = []
+            orientation_outputs = []
 
         return {
             'sr_output': sr_output,
-            'modality_outputs': modality_outputs,
+            'orientation_outputs': orientation_outputs,
             'posteriors': posteriors,
             'latent_samples': latent_samples
         }
@@ -243,12 +243,12 @@ class UHVEDLite(nn.Module):
     Differences from full U-HVED:
     - Fewer scales
     - Shared encoder/decoder
-    - No modality reconstruction branch
+    - No orientation reconstruction branch
     """
 
     def __init__(
         self,
-        num_modalities: int = 4,
+        num_orientations: int = 4,
         in_channels: int = 1,
         out_channels: int = 1,
         base_channels: int = 16,
@@ -256,9 +256,9 @@ class UHVEDLite(nn.Module):
     ):
         super().__init__()
 
-        self.num_modalities = num_modalities
+        self.num_orientations = num_orientations
 
-        # Shared encoder for all modalities
+        # Shared encoder for all orientations
         self.encoder = ConvEncoder(
             in_channels=in_channels,
             base_channels=base_channels,
@@ -277,24 +277,24 @@ class UHVEDLite(nn.Module):
 
     def forward(
         self,
-        modalities: List[torch.Tensor],
-        modality_mask: Optional[torch.Tensor] = None
+        orientations: List[torch.Tensor],
+        orientation_mask: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass.
 
         Args:
-            modalities: List of input tensors
-            modality_mask: Boolean mask for present modalities
+            orientations: List of input tensors
+            orientation_mask: Boolean mask for present orientations
 
         Returns:
             Dictionary with 'sr_output' and 'posteriors'
         """
-        # Encode each modality with shared encoder
+        # Encode each orientation with shared encoder
         all_outputs = [{'mu': {}, 'logvar': {}, 'features': {}} for _ in range(len(self.encoder.hidden_dims))]
 
-        for mod_idx, mod_input in enumerate(modalities):
-            if modality_mask is not None and not modality_mask[mod_idx]:
+        for mod_idx, mod_input in enumerate(orientations):
+            if orientation_mask is not None and not orientation_mask[mod_idx]:
                 continue
 
             mod_outputs = self.encoder(mod_input)
@@ -305,7 +305,7 @@ class UHVEDLite(nn.Module):
                 all_outputs[scale_idx]['features'][mod_idx] = scale_out['features']
 
         # Fuse
-        latent_samples, posteriors = self.fusion(all_outputs, modality_mask)
+        latent_samples, posteriors = self.fusion(all_outputs, orientation_mask)
 
         # Decode
         sr_output = self.decoder(latent_samples)
@@ -313,7 +313,7 @@ class UHVEDLite(nn.Module):
         return {
             'sr_output': sr_output,
             'posteriors': posteriors,
-            'modality_outputs': []
+            'orientation_outputs': []
         }
 
 
@@ -327,7 +327,7 @@ class UHVEDWithUpscale(nn.Module):
 
     def __init__(
         self,
-        num_modalities: int = 4,
+        num_orientations: int = 4,
         in_channels: int = 1,
         out_channels: int = 1,
         base_channels: int = 32,
@@ -336,7 +336,7 @@ class UHVEDWithUpscale(nn.Module):
     ):
         """
         Args:
-            num_modalities: Number of input modalities
+            num_orientations: Number of input orientations
             in_channels: Input channels
             out_channels: Output channels
             base_channels: Base channel count
@@ -349,12 +349,12 @@ class UHVEDWithUpscale(nn.Module):
 
         # Base U-HVED
         self.uhved = UHVED(
-            num_modalities=num_modalities,
+            num_orientations=num_orientations,
             in_channels=in_channels,
             out_channels=base_channels,  # Output features, not final image
             base_channels=base_channels,
             num_scales=num_scales,
-            reconstruct_modalities=False
+            reconstruct_orientations=False
         )
 
         # Upscaling module
@@ -385,21 +385,21 @@ class UHVEDWithUpscale(nn.Module):
 
     def forward(
         self,
-        modalities: List[torch.Tensor],
-        modality_mask: Optional[torch.Tensor] = None
+        orientations: List[torch.Tensor],
+        orientation_mask: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass with upscaling.
 
         Args:
-            modalities: List of input tensors
-            modality_mask: Boolean mask
+            orientations: List of input tensors
+            orientation_mask: Boolean mask
 
         Returns:
             Dictionary with upscaled 'sr_output' and 'posteriors'
         """
         # Get base features
-        outputs = self.uhved(modalities, modality_mask)
+        outputs = self.uhved(orientations, orientation_mask)
 
         # Upscale
         sr_output = self.upscale(outputs['sr_output'])
@@ -407,7 +407,7 @@ class UHVEDWithUpscale(nn.Module):
         return {
             'sr_output': sr_output,
             'posteriors': outputs['posteriors'],
-            'modality_outputs': outputs['modality_outputs']
+            'orientation_outputs': outputs['orientation_outputs']
         }
 
 
@@ -432,26 +432,26 @@ def create_uhved(
     configs = {
         'default': {
             'class': UHVED,
-            'num_modalities': 4,
+            'num_orientations': 4,
             'base_channels': 32,
             'num_scales': 4
         },
         'lite': {
             'class': UHVEDLite,
-            'num_modalities': 4,
+            'num_orientations': 4,
             'base_channels': 16,
             'num_scales': 3
         },
         'sr2x': {
             'class': UHVEDWithUpscale,
-            'num_modalities': 4,
+            'num_orientations': 4,
             'base_channels': 32,
             'num_scales': 4,
             'upscale_factor': 2
         },
         'sr4x': {
             'class': UHVEDWithUpscale,
-            'num_modalities': 4,
+            'num_orientations': 4,
             'base_channels': 32,
             'num_scales': 4,
             'upscale_factor': 4

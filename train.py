@@ -69,8 +69,8 @@ def train_uhved_model(
     prob_bias_field: float = 0.5,
     prob_noise: float = 0.8,
     apply_intensity_aug: bool = True,
-    modality_dropout_prob: float = 0.0,
-    min_modalities: int = 1,
+    orientation_dropout_prob: float = 0.0,
+    min_orientations: int = 1,
     num_workers: int = None,
     use_cache: bool = False,
     use_wandb: bool = False,
@@ -87,7 +87,7 @@ def train_uhved_model(
     kl_weight: float = 0.1,
     perceptual_weight: float = 0.1,
     ssim_weight: float = 0.1,
-    modality_weight: float = 0.4,
+    orientation_weight: float = 0.4,
     use_perceptual: bool = False,
     use_ssim: bool = True,
     perceptual_backend: str = 'medicalnet',
@@ -120,8 +120,8 @@ def train_uhved_model(
         prob_bias_field: Probability of bias field
         prob_noise: Probability of noise
         apply_intensity_aug: Whether to apply intensity augmentation
-        modality_dropout_prob: Probability of applying modality dropout (0.0-1.0)
-        min_modalities: Minimum number of modalities to keep after dropout (1-3)
+        orientation_dropout_prob: Probability of applying orientation dropout (0.0-1.0)
+        min_orientations: Minimum number of orientations to keep after dropout (1-3)
         num_workers: Number of data loading workers
         use_cache: Whether to use CacheDataset
         use_wandb: Whether to use Weights & Biases for tracking
@@ -138,7 +138,7 @@ def train_uhved_model(
         kl_weight: Weight for KL divergence loss
         perceptual_weight: Weight for perceptual loss
         ssim_weight: Weight for SSIM loss
-        modality_weight: Weight for modality reconstruction loss
+        orientation_weight: Weight for orientation reconstruction loss
         use_perceptual: Whether to use perceptual loss
         use_ssim: Whether to use SSIM loss
         perceptual_backend: Backend for perceptual loss ('medicalnet' or 'monai', 'models_genesis')
@@ -194,8 +194,8 @@ def train_uhved_model(
         print(f"  - Stack 0 (Axial): High in-plane (R,A), Low through-plane (S)")
         print(f"  - Stack 1 (Coronal): High in-plane (R,S), Low through-plane (A)")
         print(f"  - Stack 2 (Sagittal): High in-plane (A,S), Low through-plane (R)")
-        if modality_dropout_prob > 0.0:
-            print(f"Modality dropout enabled: {modality_dropout_prob:.2f} probability, min {min_modalities} modalities")
+        if orientation_dropout_prob > 0.0:
+            print(f"orientation dropout enabled: {orientation_dropout_prob:.2f} probability, min {min_orientations} orientations")
             print(f"  → Training will randomly drop views to simulate missing data")
 
     generator = HRLRDataGenerator(
@@ -212,8 +212,8 @@ def train_uhved_model(
         prob_noise=prob_noise,
         apply_intensity_aug=apply_intensity_aug,
         clip_to_unit_range=True,
-        modality_dropout_prob=modality_dropout_prob,
-        min_modalities=min_modalities,
+        orientation_dropout_prob=orientation_dropout_prob,
+        min_orientations=min_orientations,
     )
 
     # Create dataset
@@ -285,19 +285,19 @@ def train_uhved_model(
     # Create U-HVED model
     if accelerator.is_main_process:
         print(f"Creating U-HVED model:")
-        print(f"  - Number of modalities: 3 (orthogonal stacks)")
+        print(f"  - Number of orientations: 3 (orthogonal stacks)")
         print(f"  - Base channels: {base_channels}")
         print(f"  - Number of scales: {num_scales}")
 
     model = UHVED(
-        num_modalities=3,  # Fixed: axial, coronal, sagittal
+        num_orientations=3,  # Fixed: axial, coronal, sagittal
         in_channels=1,
         out_channels=1,
         base_channels=base_channels,
         num_scales=num_scales,
         share_encoder=False,  # Independent encoders for each orientation
         share_decoder=False,
-        reconstruct_modalities=True,  # Reconstruct input modalities for training
+        reconstruct_orientations=True,  # Reconstruct input orientations for training
     )
 
     # Load checkpoint weights if available
@@ -315,14 +315,14 @@ def train_uhved_model(
         kl_weight=kl_weight,
         perceptual_weight=perceptual_weight,
         ssim_weight=ssim_weight,
-        modality_weight=modality_weight,
+        orientation_weight=orientation_weight,
         use_perceptual=use_perceptual,
         use_ssim=use_ssim,
         perceptual_backend=perceptual_backend,
     )
 
     if accelerator.is_main_process:
-        print(f"Loss weights: recon={recon_weight}, kl={kl_weight}, perceptual={perceptual_weight}, modality={modality_weight}")
+        print(f"Loss weights: recon={recon_weight}, kl={kl_weight}, perceptual={perceptual_weight}, orientation={orientation_weight}")
 
     # Calculate total training steps for scheduler
     num_steps = len(dataloader) * epochs
@@ -377,7 +377,7 @@ def train_uhved_model(
     if use_wandb and accelerator.is_main_process:
         wandb_config = {
             "model": "uhved",
-            "num_modalities": 3,
+            "num_orientations": 3,
             "base_channels": base_channels,
             "num_scales": num_scales,
             "epochs": epochs,
@@ -386,7 +386,7 @@ def train_uhved_model(
             "output_shape": output_shape,
             "kl_weight": kl_weight,
             "perceptual_weight": perceptual_weight,
-            "modality_weight": modality_weight,
+            "orientation_weight": orientation_weight,
             "model_parameters": sum(p.numel() for p in model.parameters()),
             "n_train_samples": len(hr_image_paths),
             "n_val_samples": len(val_image_paths) if val_image_paths else 0,
@@ -410,7 +410,7 @@ def train_uhved_model(
         csv_filename = f"training_log_{timestamp}.csv"
         csv_path = os.path.join(model_dir, csv_filename)
 
-        csv_headers = ["epoch", "train_loss", "train_recon", "train_kl", "train_ssim", "train_perceptual", "train_modality",
+        csv_headers = ["epoch", "train_loss", "train_recon", "train_kl", "train_ssim", "train_perceptual", "train_orientation",
                         "learning_rate", "epoch_time"]
         if val_dataloader:
             csv_headers.extend(["val_loss", "val_mae", "val_mse", "val_rmse", "val_psnr", "val_r2", "val_ssim", "validation_time"])
@@ -430,7 +430,7 @@ def train_uhved_model(
         epoch_kl_loss = 0.0
         epoch_ssim_loss = 0.0
         epoch_perceptual_loss = 0.0
-        epoch_modality_loss = 0.0
+        epoch_orientation_loss = 0.0
 
         pbar = tqdm(
             dataloader,
@@ -441,31 +441,31 @@ def train_uhved_model(
         )
 
         for batch_idx, batch_data in enumerate(pbar):
-            # Unpack batch: (lr_stacks_list, hr, resolutions_list, thicknesses_list, modality_mask)
-            lr_stacks_list, target_img, resolutions_list, thicknesses_list, modality_mask = batch_data
+            # Unpack batch: (lr_stacks_list, hr, resolutions_list, thicknesses_list, orientation_mask)
+            lr_stacks_list, target_img, resolutions_list, thicknesses_list, orientation_mask = batch_data
 
             # lr_stacks_list is a list of 3 tensors, each (B, C, D, H, W)
             # We need to convert to the format U-HVED expects: list of (B, C, D, H, W)
-            modalities = lr_stacks_list  # Already in correct format
+            orientations = lr_stacks_list  # Already in correct format
 
             # Ensure consistent dtype
-            modalities = [m.float() for m in modalities]
+            orientations = [m.float() for m in orientations]
             target_img = target_img.float()
 
             # Forward and backward pass
             with accelerator.accumulate(model):
-                # Note: We don't pass modality_mask because we already zeroed out
-                # dropped modalities in the data generator. The zeroed modalities
-                # will naturally contribute near-zero to the Product of Gaussians fusion.
-                outputs = model(modalities)
+                # Pass orientation_mask to the model's fusion mechanism
+                # The mask indicates which orientations are present for each sample
+                # The fusion will exclude masked-out orientations from Product of Gaussians
+                outputs = model(orientations, orientation_mask=orientation_mask)
 
                 # Compute loss
                 losses = criterion(
                     sr_output=outputs['sr_output'],
                     sr_target=target_img,
                     posteriors=outputs['posteriors'],
-                    modality_outputs=outputs.get('modality_outputs'),
-                    modality_targets=modalities,
+                    orientation_outputs=outputs.get('orientation_outputs'),
+                    orientation_targets=orientations,
                     return_components=True
                 )
 
@@ -487,7 +487,7 @@ def train_uhved_model(
             epoch_kl_loss += losses['kl'].item()
             epoch_ssim_loss += losses['ssim'].item() if 'ssim' in losses else 0.0
             epoch_perceptual_loss += losses['perceptual'].item() if 'perceptual' in losses else 0.0
-            epoch_modality_loss += losses['modality'].item() if 'modality' in losses else 0.0
+            epoch_orientation_loss += losses['orientation'].item() if 'orientation' in losses else 0.0
 
             # Update progress bar with loss and memory
             current_lr = optimizer.param_groups[0]['lr']
@@ -497,7 +497,7 @@ def train_uhved_model(
                 "kl": f"{losses['kl'].item():.4f}",
                 "ssim": f"{losses['ssim'].item():.4f}" if 'ssim' in losses else "N/A",
                 "perceptual": f"{losses['perceptual'].item():.4f}" if 'perceptual' in losses else "N/A",
-                "modality": f"{losses['modality'].item():.4f}" if 'modality' in losses else "N/A",
+                "orientation": f"{losses['orientation'].item():.4f}" if 'orientation' in losses else "N/A",
                 "lr": f"{current_lr:.2e}"
             }
 
@@ -519,7 +519,7 @@ def train_uhved_model(
         avg_kl = epoch_kl_loss / len(dataloader)
         avg_ssim = epoch_ssim_loss / len(dataloader) if epoch_ssim_loss > 0 else 0.0
         avg_perceptual = epoch_perceptual_loss / len(dataloader) if epoch_perceptual_loss > 0 else 0.0
-        avg_modality = epoch_modality_loss / len(dataloader) if epoch_modality_loss > 0 else 0.0
+        avg_orientation = epoch_orientation_loss / len(dataloader) if epoch_orientation_loss > 0 else 0.0
 
         # Validation
         val_loss = None
@@ -535,8 +535,8 @@ def train_uhved_model(
 
             with torch.no_grad():
                 for val_batch_data in val_dataloader:
-                    lr_stacks_list, target_img, _, _, modality_mask = val_batch_data
-                    modalities = [m.float() for m in lr_stacks_list]
+                    lr_stacks_list, target_img, _, _, orientation_mask = val_batch_data
+                    orientations = [m.float() for m in lr_stacks_list]
                     target_img = target_img.float()
 
                     # Use sliding window inference if enabled
@@ -544,19 +544,19 @@ def train_uhved_model(
                         # For sliding window, process on main device
                         sr_output = sliding_window_inference(
                             model=accelerator.unwrap_model(model),
-                            modalities=modalities,
+                            orientations=orientations,
                             patch_size=val_patch_size,
                             overlap=val_overlap,
                             batch_size=1,
                             device=accelerator.device,
                             blend_mode="gaussian",
                             progress=False,
+                            orientation_mask=orientation_mask,
                         )
                         outputs = {'sr_output': sr_output, 'posteriors': None}
                     else:
-                        # Note: We don't pass modality_mask - zeroed modalities
-                        # naturally contribute near-zero to the fusion
-                        outputs = model(modalities)
+                        # Pass orientation_mask to the model's fusion mechanism
+                        outputs = model(orientations, orientation_mask=orientation_mask)
 
                     losses = criterion(
                         sr_output=outputs['sr_output'],
@@ -581,7 +581,7 @@ def train_uhved_model(
             # Print validation results (use accelerator.print to avoid tqdm interference)
             accelerator.print(
                 f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_loss:.4f} "
-                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, Modality: {avg_modality:.4f}) - Val Loss: {val_loss:.4f}"
+                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, orientation: {avg_orientation:.4f}) - Val Loss: {val_loss:.4f}"
             )
             accelerator.print(
                 f"  Val Metrics - MAE: {val_metrics['mae']:.4f} | RMSE: {val_metrics['rmse']:.4f} | "
@@ -593,7 +593,7 @@ def train_uhved_model(
             # Print training summary (use accelerator.print to avoid tqdm interference)
             accelerator.print(
                 f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f} "
-                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, Modality: {avg_modality:.4f}) - LR: {current_lr:.2e}"
+                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, orientation: {avg_orientation:.4f}) - LR: {current_lr:.2e}"
             )
 
         # Log to CSV
@@ -605,7 +605,7 @@ def train_uhved_model(
                 "train_kl": avg_kl,
                 "train_ssim": avg_ssim,
                 "train_perceptual": avg_perceptual,
-                "train_modality": avg_modality,
+                "train_orientation": avg_orientation,
                 "learning_rate": current_lr,
                 "epoch_time": epoch_time,
             }
@@ -632,7 +632,7 @@ def train_uhved_model(
                 "train/kl": avg_kl,
                 "train/ssim": avg_ssim,
                 "train/perceptual": avg_perceptual,
-                "train/modality": avg_modality,
+                "train/orientation": avg_orientation,
                 "train/learning_rate": current_lr,
             }
             if val_loss is not None and val_metrics is not None:
@@ -656,7 +656,7 @@ def train_uhved_model(
 
                 model_config = {
                     "model_architecture": "uhved",
-                    "num_modalities": 3,
+                    "num_orientations": 3,
                     "base_channels": base_channels,
                     "num_scales": num_scales,
                     "output_shape": output_shape,
@@ -668,7 +668,7 @@ def train_uhved_model(
                     "recon_weight": recon_weight,
                     "ssim_weight": ssim_weight,
                     "perceptual_weight": perceptual_weight,
-                    "modality_weight": modality_weight,
+                    "orientation_weight": orientation_weight,
                 }
 
                 unwrapped_model = accelerator.unwrap_model(model)
@@ -697,7 +697,7 @@ def train_uhved_model(
 
                 model_config = {
                     "model_architecture": "uhved",
-                    "num_modalities": 3,
+                    "num_orientations": 3,
                     "base_channels": base_channels,
                     "num_scales": num_scales,
                     "output_shape": output_shape,
@@ -707,7 +707,7 @@ def train_uhved_model(
                     "learning_rate": learning_rate,
                     "kl_weight": kl_weight,
                     "perceptual_weight": perceptual_weight,
-                    "modality_weight": modality_weight,
+                    "orientation_weight": orientation_weight,
                 }
 
                 unwrapped_model = accelerator.unwrap_model(model)
@@ -736,7 +736,7 @@ def train_uhved_model(
         final_path = os.path.join(model_dir, "uhved_orthogonal_final.pth")
         model_config = {
             "model_architecture": "uhved",
-            "num_modalities": 3,
+            "num_orientations": 3,
             "base_channels": base_channels,
             "num_scales": num_scales,
             "output_shape": output_shape,
@@ -746,7 +746,7 @@ def train_uhved_model(
             "learning_rate": learning_rate,
             "kl_weight": kl_weight,
             "perceptual_weight": perceptual_weight,
-            "modality_weight": modality_weight,
+            "orientation_weight": orientation_weight,
         }
 
         unwrapped_model = accelerator.unwrap_model(model)
@@ -823,7 +823,7 @@ if __name__ == "__main__":
     parser.add_argument("--kl_weight", type=float, default=0.1, help="KL divergence weight")
     parser.add_argument("--perceptual_weight", type=float, default=0.1, help="Perceptual loss weight")
     parser.add_argument("--ssim_weight", type=float, default=0.1, help="SSIM loss weight")
-    parser.add_argument("--modality_weight", type=float, default=0.4, help="Modality reconstruction weight")
+    parser.add_argument("--orientation_weight", type=float, default=0.4, help="orientation reconstruction weight")
     parser.add_argument("--use_perceptual", action="store_true", help="Use perceptual loss")
     parser.add_argument("--use_ssim", action="store_true", help="Use SSIM loss")
     parser.add_argument("--perceptual_backend", type=str, default="medicalnet",
@@ -841,13 +841,13 @@ if __name__ == "__main__":
     parser.add_argument("--prob_noise", type=float, default=0.8, help="Probability of noise")
     parser.add_argument("--no_intensity_aug", action="store_true", help="Disable intensity augmentation")
 
-    # Modality dropout (for robust training with missing views)
-    parser.add_argument("--modality_dropout_prob", type=float, default=0.0,
-                        help="Probability of applying modality dropout (0.0-1.0). "
+    # orientation dropout (for robust training with missing views)
+    parser.add_argument("--orientation_dropout_prob", type=float, default=0.0,
+                        help="Probability of applying orientation dropout (0.0-1.0). "
                              "Randomly drops 1-2 orthogonal views to simulate missing data during inference. "
                              "Default: 0.0 (no dropout)")
-    parser.add_argument("--min_modalities", type=int, default=1,
-                        help="Minimum number of modalities to keep after dropout (1-3). "
+    parser.add_argument("--min_orientations", type=int, default=1,
+                        help="Minimum number of orientations to keep after dropout (1-3). "
                              "Default: 1 (allows training with single views)")
 
     # Other parameters
@@ -938,8 +938,8 @@ if __name__ == "__main__":
         prob_bias_field=args.prob_bias_field,
         prob_noise=args.prob_noise,
         apply_intensity_aug=not args.no_intensity_aug,
-        modality_dropout_prob=args.modality_dropout_prob,
-        min_modalities=args.min_modalities,
+        orientation_dropout_prob=args.orientation_dropout_prob,
+        min_orientations=args.min_orientations,
         num_workers=args.num_workers,
         use_cache=args.use_cache,
         use_wandb=args.use_wandb,
@@ -956,7 +956,7 @@ if __name__ == "__main__":
         kl_weight=args.kl_weight,
         perceptual_weight=args.perceptual_weight,
         ssim_weight=args.ssim_weight,
-        modality_weight=args.modality_weight,
+        orientation_weight=args.orientation_weight,
         use_perceptual=args.use_perceptual,
         use_ssim=args.use_ssim,
         perceptual_backend=args.perceptual_backend,

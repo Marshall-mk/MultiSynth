@@ -18,26 +18,26 @@ from pathlib import Path
 from src import UHVED, UHVEDLite, UHVEDWithUpscale, create_uhved
 
 
-def create_sample_inputs(num_modalities=3, in_channels=1, depth=64, height=64, width=64, batch_size=1):
+def create_sample_inputs(num_orientations=3, in_channels=1, depth=64, height=64, width=64, batch_size=1):
     """
     Create sample input tensors for the model.
 
     Args:
-        num_modalities: Number of input modalities
-        in_channels: Number of channels per modality
+        num_orientations: Number of input orientations
+        in_channels: Number of channels per orientation
         depth: Input depth (3D dimension)
         height: Input height
         width: Input width
         batch_size: Batch size
 
     Returns:
-        List of input tensors, one per modality (B, C, D, H, W)
+        List of input tensors, one per orientation (B, C, D, H, W)
     """
-    modalities = []
-    for _ in range(num_modalities):
-        modality = torch.randn(batch_size, in_channels, depth, height, width)
-        modalities.append(modality)
-    return modalities
+    orientations = []
+    for _ in range(num_orientations):
+        orientation = torch.randn(batch_size, in_channels, depth, height, width)
+        orientations.append(orientation)
+    return orientations
 
 
 def visualize_uhved_config(config_name, output_dir="architecture_plots"):
@@ -72,14 +72,14 @@ def visualize_uhved_config(config_name, output_dir="architecture_plots"):
     elif config_name == "custom":
         # Custom configuration example
         model = UHVED(
-            num_modalities=3,
+            num_orientations=3,
             in_channels=1,
             out_channels=1,
             base_channels=16,
             num_scales=3,
             share_encoder=True,
             share_decoder=True,
-            reconstruct_modalities=False
+            reconstruct_orientations=False
         )
         input_size = (64, 64, 64)
     else:
@@ -96,14 +96,14 @@ def visualize_uhved_config(config_name, output_dir="architecture_plots"):
     print(f"Trainable parameters: {num_trainable:,}")
 
     # Create sample inputs
-    num_modalities = 3
+    num_orientations = 3
     in_channels = 1
 
-    print(f"Input shape per modality: (1, {in_channels}, {input_size[0]}, {input_size[1]}, {input_size[2]})")
-    print(f"Number of modalities: {num_modalities}")
+    print(f"Input shape per orientation: (1, {in_channels}, {input_size[0]}, {input_size[1]}, {input_size[2]})")
+    print(f"Number of orientations: {num_orientations}")
 
-    modalities = create_sample_inputs(
-        num_modalities=num_modalities,
+    orientations = create_sample_inputs(
+        num_orientations=num_orientations,
         in_channels=in_channels,
         depth=input_size[0],
         height=input_size[1],
@@ -114,7 +114,7 @@ def visualize_uhved_config(config_name, output_dir="architecture_plots"):
     # Forward pass
     print("Running forward pass...")
     with torch.no_grad():
-        outputs = model(modalities)
+        outputs = model(orientations)
 
     # Handle different output formats
     if isinstance(outputs, dict):
@@ -139,8 +139,8 @@ def visualize_uhved_config(config_name, output_dir="architecture_plots"):
     # Re-run with gradients for visualization
     print("Generating visualization...")
     model.train()  # Enable gradients
-    modalities_grad = [m.requires_grad_(True) for m in modalities]
-    outputs_grad = model(modalities_grad)
+    orientations_grad = [m.requires_grad_(True) for m in orientations]
+    outputs_grad = model(orientations_grad)
 
     if isinstance(outputs_grad, dict):
         output_tensor_grad = outputs_grad.get('sr_output',

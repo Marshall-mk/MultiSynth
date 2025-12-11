@@ -579,7 +579,7 @@ class UHVEDLoss(nn.Module):
                + kl_weight * L_kl
                + perceptual_weight * L_perceptual_3d
                + ssim_weight * L_ssim_3d
-               + modality_weight * L_modality_recon
+               + orientation_weight * L_orientation_recon
 
     Features:
     - Supports multiple 3D perceptual loss backends
@@ -595,7 +595,7 @@ class UHVEDLoss(nn.Module):
         kl_weight: float = 0.001,
         perceptual_weight: float = 0.1,
         ssim_weight: float = 0.0,
-        modality_weight: float = 0.5,
+        orientation_weight: float = 0.5,
         use_perceptual: bool = True,
         use_ssim: bool = False,
         perceptual_backend: Literal['medicalnet', 'monai', 'models_genesis'] = 'medicalnet',
@@ -610,7 +610,7 @@ class UHVEDLoss(nn.Module):
             kl_weight: Weight for KL divergence
             perceptual_weight: Weight for 3D perceptual loss
             ssim_weight: Weight for 3D SSIM loss
-            modality_weight: Weight for modality reconstruction loss
+            orientation_weight: Weight for orientation reconstruction loss
             use_perceptual: Whether to use 3D perceptual loss
             use_ssim: Whether to use 3D SSIM loss
             perceptual_backend: Which 3D model to use for perceptual loss
@@ -627,7 +627,7 @@ class UHVEDLoss(nn.Module):
         self.kl_weight = kl_weight
         self.perceptual_weight = perceptual_weight
         self.ssim_weight = ssim_weight
-        self.modality_weight = modality_weight
+        self.orientation_weight = orientation_weight
         self.kl_annealing = kl_annealing
         self.kl_anneal_steps = kl_anneal_steps
 
@@ -680,8 +680,8 @@ class UHVEDLoss(nn.Module):
         sr_output: torch.Tensor,
         sr_target: torch.Tensor,
         posteriors: List[Tuple[torch.Tensor, torch.Tensor]],
-        modality_outputs: Optional[List[torch.Tensor]] = None,
-        modality_targets: Optional[List[torch.Tensor]] = None,
+        orientation_outputs: Optional[List[torch.Tensor]] = None,
+        orientation_targets: Optional[List[torch.Tensor]] = None,
         return_components: bool = False
     ) -> torch.Tensor | Dict[str, torch.Tensor]:
         """
@@ -691,8 +691,8 @@ class UHVEDLoss(nn.Module):
             sr_output: Super-resolved output (B, C, D, H, W)
             sr_target: Ground truth high-resolution volume (B, C, D, H, W)
             posteriors: List of (mu, logvar) from encoder
-            modality_outputs: Reconstructed modalities (optional)
-            modality_targets: Target modalities (optional)
+            orientation_outputs: Reconstructed orientations (optional)
+            orientation_targets: Target orientations (optional)
             return_components: If True, return dict of individual losses
 
         Returns:
@@ -727,15 +727,15 @@ class UHVEDLoss(nn.Module):
         else:
             losses['ssim'] = torch.tensor(0.0, device=sr_output.device)
 
-        # Modality reconstruction loss
-        if modality_outputs is not None and modality_targets is not None:
+        # orientation reconstruction loss
+        if orientation_outputs is not None and orientation_targets is not None:
             mod_loss = 0.0
-            for mod_out, mod_target in zip(modality_outputs, modality_targets):
+            for mod_out, mod_target in zip(orientation_outputs, orientation_targets):
                 if mod_target is not None:
                     mod_loss = mod_loss + self.recon_loss(mod_out, mod_target)
-            losses['modality'] = mod_loss * self.modality_weight
+            losses['orientation'] = mod_loss * self.orientation_weight
         else:
-            losses['modality'] = torch.tensor(0.0, device=sr_output.device)
+            losses['orientation'] = torch.tensor(0.0, device=sr_output.device)
 
         # Total loss
         total_loss = sum(losses.values())

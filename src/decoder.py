@@ -5,7 +5,7 @@ The decoder takes multi-scale latent samples and skip connections to
 reconstruct the high-resolution output image.
 
 For super-resolution adaptation:
-- Output is a single high-resolution image (or multiple modality reconstructions)
+- Output is a single high-resolution image (or multiple Orientation reconstructions)
 - Progressive upsampling with skip connections
 - Sub-pixel convolution option for efficient upsampling
 """
@@ -299,15 +299,15 @@ class MultiOutputDecoder(nn.Module):
     """
     Decoder that produces multiple outputs:
     - Super-resolved image
-    - Reconstructed modalities (for reconstruction loss)
+    - Reconstructed orientations (for reconstruction loss)
 
     This follows the original U-HVED design where there are n+1 decoders
-    (n for modality reconstruction, 1 for the main task).
+    (n for Orientation reconstruction, 1 for the main task).
     """
 
     def __init__(
         self,
-        num_modalities: int = 4,
+        num_orientations: int = 4,
         out_channels: int = 1,
         base_channels: int = 32,
         num_scales: int = 4,
@@ -317,17 +317,17 @@ class MultiOutputDecoder(nn.Module):
     ):
         """
         Args:
-            num_modalities: Number of input modalities to reconstruct
-            out_channels: Output channels per modality/SR output
+            num_orientations: Number of input orientations to reconstruct
+            out_channels: Output channels per Orientation/SR output
             base_channels: Base channel count
             num_scales: Number of decoding scales
             upsample_mode: Upsampling strategy
             activation: Activation function
-            share_decoder: If True, share decoder weights across modalities
+            share_decoder: If True, share decoder weights across orientations
         """
         super().__init__()
 
-        self.num_modalities = num_modalities
+        self.num_orientations = num_orientations
         self.share_decoder = share_decoder
 
         # Main super-resolution decoder
@@ -340,9 +340,9 @@ class MultiOutputDecoder(nn.Module):
             final_activation='tanh'
         )
 
-        # Modality reconstruction decoders
+        # Orientation reconstruction decoders
         if share_decoder:
-            self.modality_decoder = ConvDecoder(
+            self.orientation_decoder = ConvDecoder(
                 out_channels=out_channels,
                 base_channels=base_channels,
                 num_scales=num_scales,
@@ -351,7 +351,7 @@ class MultiOutputDecoder(nn.Module):
                 final_activation='tanh'
             )
         else:
-            self.modality_decoders = nn.ModuleList([
+            self.orientation_decoders = nn.ModuleList([
                 ConvDecoder(
                     out_channels=out_channels,
                     base_channels=base_channels,
@@ -360,41 +360,41 @@ class MultiOutputDecoder(nn.Module):
                     activation=activation,
                     final_activation='tanh'
                 )
-                for _ in range(num_modalities)
+                for _ in range(num_orientations)
             ])
 
     def forward(
         self,
         latent_samples: List[torch.Tensor],
         skip_features: Optional[List[torch.Tensor]] = None,
-        reconstruct_modalities: bool = True
+        reconstruct_orientations: bool = True
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
-        Decode to super-resolved image and reconstructed modalities.
+        Decode to super-resolved image and reconstructed orientations.
 
         Args:
             latent_samples: Multi-scale latent samples
             skip_features: Optional encoder skip features
-            reconstruct_modalities: Whether to also reconstruct input modalities
+            reconstruct_orientations: Whether to also reconstruct input orientations
 
         Returns:
             sr_output: Super-resolved image
-            modality_outputs: List of reconstructed modalities (empty if not requested)
+            orientation_outputs: List of reconstructed orientations (empty if not requested)
         """
         # Main SR output
         sr_output = self.sr_decoder(latent_samples, skip_features)
 
-        # Modality reconstructions
-        modality_outputs = []
-        if reconstruct_modalities:
-            for i in range(self.num_modalities):
+        # Orientation reconstructions
+        orientation_outputs = []
+        if reconstruct_orientations:
+            for i in range(self.num_orientations):
                 if self.share_decoder:
-                    mod_out = self.modality_decoder(latent_samples, skip_features)
+                    mod_out = self.orientation_decoder(latent_samples, skip_features)
                 else:
-                    mod_out = self.modality_decoders[i](latent_samples, skip_features)
-                modality_outputs.append(mod_out)
+                    mod_out = self.orientation_decoders[i](latent_samples, skip_features)
+                orientation_outputs.append(mod_out)
 
-        return sr_output, modality_outputs
+        return sr_output, orientation_outputs
 
 
 class PixelShuffleUpscaler(nn.Module):

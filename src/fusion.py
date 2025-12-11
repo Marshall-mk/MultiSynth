@@ -2,20 +2,20 @@
 Product of Gaussians Fusion for U-HVED
 
 This module implements the key innovation of U-HVED: fusing variational
-distributions from multiple modalities via the product of Gaussians.
+distributions from multiple orientations via the product of Gaussians.
 
-The idea is that each modality provides its own estimate of the latent
+The idea is that each orientation provides its own estimate of the latent
 representation as a Gaussian distribution (mu, sigma). By taking the
 product of these distributions, we get a fused distribution that combines
-information from all available modalities.
+information from all available orientations.
 
 Key property: The product of Gaussians is also a Gaussian, and its
 parameters can be computed in closed form:
     T_fused = sum(T_i)  where T_i = 1/var_i (precision)
     mu_fused = sum(mu_i * T_i) / T_fused
 
-This allows the network to handle missing modalities gracefully - we simply
-exclude missing modalities from the sum.
+This allows the network to handle missing orientations gracefully - we simply
+exclude missing orientations from the sum.
 """
 
 import torch
@@ -25,9 +25,9 @@ from typing import Dict, List, Optional, Tuple
 
 class ProductOfGaussians(nn.Module):
     """
-    Fuses variational parameters from multiple modalities via Product of Gaussians.
+    Fuses variational parameters from multiple orientations via Product of Gaussians.
 
-    Given mu and logvar from each modality, computes the fused posterior
+    Given mu and logvar from each orientation, computes the fused posterior
     using precision-weighted combination with an optional prior.
     """
 
@@ -56,47 +56,70 @@ class ProductOfGaussians(nn.Module):
         self,
         mus: Dict[int, torch.Tensor],
         logvars: Dict[int, torch.Tensor],
-        modality_mask: Optional[torch.Tensor] = None
+        orientation_mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute fused posterior via product of Gaussians.
 
         Args:
-            mus: Dict mapping modality index to mu tensor (B, C, D, H, W)
-            logvars: Dict mapping modality index to logvar tensor (B, C, D, H, W)
-            modality_mask: Optional boolean tensor (num_modalities,) indicating
-                          which modalities to include
+            mus: Dict mapping orientation index to mu tensor (B, C, D, H, W)
+            logvars: Dict mapping orientation index to logvar tensor (B, C, D, H, W)
+            orientation_mask: Optional boolean tensor indicating which orientations to include
+                          - Shape (num_orientations,): same mask for all batch elements
+                          - Shape (B, num_orientations): different mask per batch element
 
         Returns:
             posterior_mu: Fused mean (B, C, D, H, W)
             posterior_logvar: Fused log-variance (B, C, D, H, W)
         """
         if len(mus) == 0:
-            raise ValueError("At least one modality must be present")
+            raise ValueError("At least one orientation must be present")
 
         # Get reference tensor for shape
         ref_tensor = next(iter(mus.values()))
         device = ref_tensor.device
         dtype = ref_tensor.dtype
+        batch_size = ref_tensor.shape[0]
+
+        # Determine mask type
+        mask_is_batched = orientation_mask is not None and orientation_mask.dim() == 2
 
         # Initialize accumulators for precision-weighted sum
         precision_sum = torch.zeros_like(ref_tensor)
         weighted_mu_sum = torch.zeros_like(ref_tensor)
 
-        # Accumulate contributions from each modality
+        # Accumulate contributions from each orientation
         for mod_idx, mu in mus.items():
-            # Skip if masked out
-            if modality_mask is not None and not modality_mask[mod_idx]:
-                continue
-
             logvar = logvars[mod_idx]
+
+            # Handle masking
+            if orientation_mask is not None:
+                if mask_is_batched:
+                    # Batched mask: (B, num_orientations)
+                    # Create mask with shape (B, 1, 1, 1, 1) for broadcasting
+                    batch_mask = orientation_mask[:, mod_idx].view(batch_size, 1, 1, 1, 1).float()
+                else:
+                    # Global mask: (num_orientations,)
+                    # Skip this orientation entirely if masked out
+                    if not orientation_mask[mod_idx]:
+                        continue
+                    batch_mask = 1.0
+            else:
+                batch_mask = 1.0
 
             # Compute precision (inverse variance)
             precision = 1.0 / (torch.exp(logvar) + self.eps)
 
+            # Apply mask to precision (zeros out contribution from masked batch elements)
+            if isinstance(batch_mask, torch.Tensor):
+                precision = precision * batch_mask
+                weighted_mu = mu * precision
+            else:
+                weighted_mu = mu * precision
+
             # Accumulate
             precision_sum = precision_sum + precision
-            weighted_mu_sum = weighted_mu_sum + mu * precision
+            weighted_mu_sum = weighted_mu_sum + weighted_mu
 
         # Add prior contribution if enabled
         if self.use_prior:
@@ -154,7 +177,7 @@ class MultiScaleFusion(nn.Module):
     Applies Product of Gaussians fusion at multiple scales.
 
     This is the main fusion module used in U-HVED, combining variational
-    parameters from all modalities at each spatial scale.
+    parameters from all orientations at each spatial scale.
     """
 
     def __init__(
@@ -176,7 +199,7 @@ class MultiScaleFusion(nn.Module):
     def forward(
         self,
         encoder_outputs: List[Dict[str, Dict[int, torch.Tensor]]],
-        modality_mask: Optional[torch.Tensor] = None,
+        orientation_mask: Optional[torch.Tensor] = None,
         deterministic: bool = False
     ) -> Tuple[List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]]:
         """
@@ -184,8 +207,8 @@ class MultiScaleFusion(nn.Module):
 
         Args:
             encoder_outputs: List (per scale) of dicts with 'mu' and 'logvar'
-                            dicts mapping modality indices to tensors
-            modality_mask: Boolean tensor indicating present modalities
+                            dicts mapping orientation indices to tensors
+            orientation_mask: Boolean tensor indicating present orientations
             deterministic: If True, return means without sampling
 
         Returns:
@@ -199,12 +222,12 @@ class MultiScaleFusion(nn.Module):
             mus = scale_data['mu']
             logvars = scale_data['logvar']
 
-            # Skip if no modalities present at this scale
+            # Skip if no orientations present at this scale
             if len(mus) == 0:
                 continue
 
             # Fuse via Product of Gaussians
-            fused_mu, fused_logvar = self.fusion(mus, logvars, modality_mask)
+            fused_mu, fused_logvar = self.fusion(mus, logvars, orientation_mask)
 
             # Sample
             z = self.sampler(fused_mu, fused_logvar, deterministic)
@@ -220,7 +243,7 @@ class AttentionFusion(nn.Module):
     Alternative fusion strategy using attention mechanism.
 
     Instead of Product of Gaussians, this uses learned attention weights
-    to combine features from different modalities. Can be used as an
+    to combine features from different orientations. Can be used as an
     ablation or alternative approach.
     """
 
@@ -250,30 +273,30 @@ class AttentionFusion(nn.Module):
     def forward(
         self,
         features: Dict[int, torch.Tensor],
-        modality_mask: Optional[torch.Tensor] = None
+        orientation_mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Fuse features using attention.
 
         Args:
-            features: Dict mapping modality index to feature tensor
-            modality_mask: Optional mask for present modalities
+            features: Dict mapping orientation index to feature tensor
+            orientation_mask: Optional mask for present orientations
 
         Returns:
             mu, logvar: Fused variational parameters
         """
         if len(features) == 0:
-            raise ValueError("At least one modality must be present")
+            raise ValueError("At least one orientation must be present")
 
         # Stack features
         feat_list = []
         for mod_idx, feat in features.items():
-            if modality_mask is not None and not modality_mask[mod_idx]:
+            if orientation_mask is not None and not orientation_mask[mod_idx]:
                 continue
             feat_list.append(feat)
 
         if len(feat_list) == 1:
-            # Single modality, no attention needed
+            # Single orientation, no attention needed
             fused = feat_list[0]
         else:
             # Stack: (B, num_mod, C, D, H, W)

@@ -641,8 +641,30 @@ class MRIArtifactSimulator(torch.nn.Module):
         image: torch.Tensor,
         acquisition_res: torch.Tensor,
         thickness: Optional[torch.Tensor] = None,
+        apply_motion: Optional[torch.Tensor] = None,
+        apply_spike: Optional[torch.Tensor] = None,
+        apply_aliasing: Optional[torch.Tensor] = None,
+        apply_noise: Optional[torch.Tensor] = None,
+        motion_axis: Optional[torch.Tensor] = None,
+        aliasing_axis: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        
+        """
+        Apply MRI artifact simulation.
+
+        Args:
+            image: Input volume (B, C, D, H, W)
+            acquisition_res: Resolution per batch (B, 3) or (3,)
+            thickness: Slice thickness per batch (B, 3) or (3,)
+            apply_motion: Pre-sampled bool mask (B,) for motion artifacts
+            apply_spike: Pre-sampled bool mask (B,) for spike artifacts
+            apply_aliasing: Pre-sampled bool mask (B,) for aliasing
+            apply_noise: Pre-sampled bool mask (B,) for noise
+            motion_axis: Pre-sampled axis (B,) for motion direction
+            aliasing_axis: Pre-sampled axis (B,) for aliasing direction
+
+        Returns:
+            Simulated LR volume (B, C, D, H, W)
+        """
         batch_size = image.shape[0]
         device = image.device
         outputs = []
@@ -651,7 +673,7 @@ class MRIArtifactSimulator(torch.nn.Module):
             img = image[b]  # (C, D, H, W)
             acq_res = acquisition_res[b] if acquisition_res.ndim > 1 else acquisition_res
             acq_res = acq_res.to(device)
-            
+
             if thickness is not None:
                 thk = thickness[b] if thickness.ndim > 1 else thickness
                 thk = thk.to(device)
@@ -660,23 +682,44 @@ class MRIArtifactSimulator(torch.nn.Module):
 
             # --- STEP 1: PSF Blurring (Slice Profile / Partial Volume) ---
             img = self.physics_engine(
-                img, 
+                img,
                 resolution=self.volume_res.to(device), # Current HR resolution
                 thickness=thk # Target slice thickness
             )
 
-
             # --- STEP 2: K-Space Artifacts (Motion / Spike) ---
-            if torch.rand(1).item() < self.prob_motion:
-                axis = torch.randint(1, 3, (1,)).item() 
+            # Use pre-sampled decisions if provided, otherwise sample randomly
+            if apply_motion is not None:
+                should_apply_motion = apply_motion[b].item()
+            else:
+                should_apply_motion = torch.rand(1).item() < self.prob_motion
+
+            if should_apply_motion:
+                if motion_axis is not None:
+                    axis = motion_axis[b].item()
+                else:
+                    axis = torch.randint(1, 3, (1,)).item()
                 img = apply_kspace_motion_ghosting(img, axis=axis, intensity=self.motion_intensity)
 
-            if torch.rand(1).item() < self.prob_spike:
+            if apply_spike is not None:
+                should_apply_spike = apply_spike[b].item()
+            else:
+                should_apply_spike = torch.rand(1).item() < self.prob_spike
+
+            if should_apply_spike:
                 img = apply_kspace_spike(img, intensity=self.spike_intensity)
-                
+
             # --- STEP 3: Aliasing ---
-            if torch.rand(1).item() < self.prob_aliasing:
-                axis = torch.randint(1, 3, (1,)).item()
+            if apply_aliasing is not None:
+                should_apply_aliasing = apply_aliasing[b].item()
+            else:
+                should_apply_aliasing = torch.rand(1).item() < self.prob_aliasing
+
+            if should_apply_aliasing:
+                if aliasing_axis is not None:
+                    axis = aliasing_axis[b].item()
+                else:
+                    axis = torch.randint(1, 3, (1,)).item()
                 img = apply_aliasing(img, axis=axis, fold_pct=0.15)
 
             # --- STEP 4: Resolution Reduction (FFT Downsample) ---
@@ -712,11 +755,16 @@ class MRIArtifactSimulator(torch.nn.Module):
                     img = torch.nn.functional.interpolate(
                         img.unsqueeze(0),
                         size=self.output_shape,
-                        mode="nearest", 
+                        mode="nearest",
                     ).squeeze(0)
 
             # --- STEP 5: Noise ---
-            if self.prob_noise > 0 and torch.rand(1).item() < self.prob_noise:
+            if apply_noise is not None:
+                should_apply_noise = apply_noise[b].item()
+            else:
+                should_apply_noise = self.prob_noise > 0 and torch.rand(1).item() < self.prob_noise
+
+            if should_apply_noise:
                 n1 = torch.randn_like(img) * self.noise_std
                 n2 = torch.randn_like(img) * self.noise_std
                 img = torch.sqrt((img + n1)**2 + n2**2)
@@ -877,10 +925,19 @@ class HRLRDataGenerator:
         """
         Create three orthogonal anisotropic resolution configurations.
 
-        Each configuration has high resolution in one axis and low resolution in the other two:
-        - Stack 0 (Axial): High res in axis 0 (D), low res in axes 1,2 (H,W)
-        - Stack 1 (Coronal): High res in axis 1 (H), low res in axes 0,2 (D,W)
-        - Stack 2 (Sagittal): High res in axis 2 (W), low res in axes 0,1 (D,H)
+        For MRI thick-slice acquisition, we sample:
+        - high_res (in-plane, isotropic across 2 axes)
+        - low_res (through-plane, anisotropic along 1 axis)
+
+        Each stack has 2 high-res axes (in-plane) and 1 low-res axis (through-plane):
+        - Stack 0 (Axial): [high, high, low] - through-plane is S (axis 2)
+        - Stack 1 (Coronal): [high, low, high] - through-plane is A (axis 1)
+        - Stack 2 (Sagittal): [low, high, high] - through-plane is R (axis 0)
+
+        After RAS orientation:
+          Axis 0 = R (Right-Left)      → Sagittal slices stack here
+          Axis 1 = A (Anterior-Post.)  → Coronal slices stack here
+          Axis 2 = S (Superior-Inf.)   → Axial slices stack here
 
         Args:
             batch_size: Number of volumes in batch
@@ -910,34 +967,50 @@ class HRLRDataGenerator:
         else:
             max_res = torch.tensor([9.0, 9.0, 9.0], device=device)
 
+        # Use min of min_res as the high resolution (isotropic in-plane)
+        high_res_value = min_res.min().item()
+
+        # Sample low resolution (through-plane) ONCE per patient
+        low_res_samples = []
+        for b in range(batch_size):
+            if self.randomise_res:
+                # Sample from range [high_res_value, max(max_res)]
+                low_res = torch.rand(1, device=device).item() * \
+                         (max_res.max() - high_res_value) + high_res_value
+            else:
+                low_res = max_res.max().item()
+            low_res_samples.append(low_res)
+
+        # Mapping stack index to through-plane axis (after RAS orientation)
+        # Stack 0 (Axial) → through-plane is axis 2 (S)
+        # Stack 1 (Coronal) → through-plane is axis 1 (A)
+        # Stack 2 (Sagittal) → through-plane is axis 0 (R)
+        stack_to_through_plane = [2, 1, 0]
+
         resolutions = []
         thicknesses = []
 
-        for high_res_axis in range(3):
-            # Create resolution config for this stack
+        for stack_idx in range(3):
+            through_plane_axis = stack_to_through_plane[stack_idx]
+
             res_batch = []
             thick_batch = []
 
             for b in range(batch_size):
+                low_res = low_res_samples[b]  # Use same low_res for this patient across all stacks
+
                 res = torch.zeros(3, device=device)
                 thick = torch.zeros(3, device=device)
 
                 for axis in range(3):
-                    if axis == high_res_axis:
-                        # This axis has high (fine) resolution
-                        res[axis] = min_res[axis]
-                        thick[axis] = min_res[axis]
+                    if axis == through_plane_axis:
+                        # Through-plane: LOW resolution (thick slices)
+                        res[axis] = low_res
+                        thick[axis] = low_res
                     else:
-                        # Other axes have low (coarse) resolution
-                        # Randomize within the anisotropic range
-                        if self.randomise_res:
-                            res[axis] = torch.rand(1, device=device).item() * \
-                                       (max_res[axis] - min_res[axis]) + min_res[axis]
-                        else:
-                            res[axis] = max_res[axis]
-
-                        # Thickness can be >= resolution (simulate thick slices)
-                        thick[axis] = res[axis]
+                        # In-plane: HIGH resolution (sharp images)
+                        res[axis] = high_res_value
+                        thick[axis] = high_res_value
 
                 res_batch.append(res)
                 thick_batch.append(thick)
@@ -955,13 +1028,21 @@ class HRLRDataGenerator:
         """
         Generate paired LR-HR training data with three orthogonal LR stacks.
 
-        Creates three low-resolution stacks from each high-resolution volume:
-        - Stack 0: High resolution in axial direction (axis 0)
-        - Stack 1: High resolution in coronal direction (axis 1)
-        - Stack 2: High resolution in sagittal direction (axis 2)
+        Creates three low-resolution stacks from each high-resolution volume.
+        Input is assumed to be RAS-oriented (from Orientationd transform).
+
+        After RAS orientation:
+          Axis 0 = R (Right-Left)      → Sagittal slices stack here
+          Axis 1 = A (Anterior-Post.)  → Coronal slices stack here
+          Axis 2 = S (Superior-Inf.)   → Axial slices stack here
+
+        Each stack simulates thick-slice MRI with 2 in-plane high-res axes and 1 through-plane low-res axis:
+        - Stack 0 (Axial): High-res in R,A (axes 0,1), Low-res in S (axis 2)
+        - Stack 1 (Coronal): High-res in R,S (axes 0,2), Low-res in A (axis 1)
+        - Stack 2 (Sagittal): High-res in A,S (axes 1,2), Low-res in R (axis 0)
 
         Args:
-            hr_images: High-resolution input images (B, C, D, H, W)
+            hr_images: High-resolution input images (B, C, D, H, W) in RAS orientation
             return_resolution: If True, also return resolution and thickness info
 
         Returns:
@@ -981,28 +1062,60 @@ class HRLRDataGenerator:
         # Generate resolution configurations for three orthogonal orientations
         resolutions, thicknesses = self._create_orthogonal_resolutions(batch_size, device)
 
+        # === STEP 3: PRE-SAMPLE ARTIFACT DECISIONS (ONCE PER PATIENT) ===
+        # These will be applied consistently across all 3 orthogonal stacks
+
+        # A. Bias field corruption - sample per patient
+        apply_bias_field = torch.rand(batch_size, device=device) < self.prob_bias_field
+
+        # B. Intensity augmentation - apply to all if enabled
+        apply_intensity_aug = self.apply_intensity_aug
+
+        # C. Physics simulation artifacts - sample per patient
+        apply_motion = torch.rand(batch_size, device=device) < self.artifact_simulator.prob_motion
+        apply_spike = torch.rand(batch_size, device=device) < self.artifact_simulator.prob_spike
+        apply_aliasing = torch.rand(batch_size, device=device) < self.artifact_simulator.prob_aliasing
+        apply_noise = torch.rand(batch_size, device=device) < self.artifact_simulator.prob_noise
+
+        # Sample random axes for motion and aliasing (same for all stacks per patient)
+        motion_axis = torch.randint(1, 3, (batch_size,), device=device)
+        aliasing_axis = torch.randint(1, 3, (batch_size,), device=device)
+
         lr_stacks = []
 
         for stack_idx in range(3):
             # Clone the normalized HR for this stack
             lr_images = hr_augmented.clone()
 
-            # === STEP 3: APPLY DEGRADATIONS ===
+            # === STEP 4: APPLY DEGRADATIONS (CONSISTENTLY ACROSS STACKS) ===
 
-            # A. Bias Field (Multiplicative shading)
-            if torch.rand(1).item() < self.prob_bias_field:
-                lr_images = self.bias(lr_images)
+            # A. Bias Field (Multiplicative shading) - apply per-volume with pre-sampled decisions
+            for b in range(batch_size):
+                if apply_bias_field[b]:
+                    lr_images[b:b+1] = self.bias(lr_images[b:b+1])
 
-            # B. Intensity Augmentation (Gamma)
-            if self.apply_intensity_aug:
-                lr_images = self.intensity_aug(lr_images)
+            # B. Intensity Augmentation (Gamma) - apply per-volume if enabled
+            if apply_intensity_aug:
+                for b in range(batch_size):
+                    lr_images[b:b+1] = self.intensity_aug(lr_images[b:b+1])
 
             # C. Physics Simulation (PSF, downsampling, noise, motion, aliasing)
+            # Pass pre-sampled decisions to ensure consistency
             resolution = resolutions[stack_idx]
             thickness = thicknesses[stack_idx]
-            lr_images = self.artifact_simulator(lr_images, resolution, thickness)
+            lr_images = self.artifact_simulator(
+                lr_images,
+                resolution,
+                thickness,
+                apply_motion=apply_motion,
+                apply_spike=apply_spike,
+                apply_aliasing=apply_aliasing,
+                apply_noise=apply_noise,
+                motion_axis=motion_axis,
+                aliasing_axis=aliasing_axis,
+            )
 
-            # === STEP 4: REALISTIC LR INTENSITY NORMALIZATION ===
+            # === STEP 5: REALISTIC LR INTENSITY NORMALIZATION ===
             if self.clip_to_unit_range:
                 # Per-volume normalization to [0, 1] using soft clipping and min-max
                 lr_norm = []
@@ -1029,7 +1142,7 @@ class HRLRDataGenerator:
         # HR is already normalized by percentiles; clip tiny float drift
         hr_augmented = torch.clamp(hr_augmented, 0.0, 1.0)
 
-        # === STEP 4: APPLY MODALITY DROPOUT (if enabled) ===
+        # === STEP 6: APPLY MODALITY DROPOUT (if enabled) ===
         # Create modality mask for simulating missing views
         modality_mask = self._create_modality_mask(batch_size, device)
 

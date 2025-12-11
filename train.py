@@ -190,10 +190,10 @@ def train_uhved_model(
     if accelerator.is_main_process:
         print(f"Input HR image resolution: {atlas_res} mm")
         print(f"Resolution randomization: {min_resolution} to {max_res_aniso} mm")
-        print(f"Generating 3 orthogonal LR stacks per HR volume")
-        print(f"  - Stack 0: High-res in Axial (D) direction")
-        print(f"  - Stack 1: High-res in Coronal (H) direction")
-        print(f"  - Stack 2: High-res in Sagittal (W) direction")
+        print(f"Generating 3 orthogonal LR stacks per HR volume (RAS-oriented)")
+        print(f"  - Stack 0 (Axial): High in-plane (R,A), Low through-plane (S)")
+        print(f"  - Stack 1 (Coronal): High in-plane (R,S), Low through-plane (A)")
+        print(f"  - Stack 2 (Sagittal): High in-plane (A,S), Low through-plane (R)")
         if modality_dropout_prob > 0.0:
             print(f"Modality dropout enabled: {modality_dropout_prob:.2f} probability, min {min_modalities} modalities")
             print(f"  → Training will randomly drop views to simulate missing data")

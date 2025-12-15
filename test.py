@@ -56,10 +56,10 @@ from tqdm import tqdm
 
 from monai.transforms import (
     Compose,
-    LoadImage,
-    EnsureChannelFirst,
-    Orientation,
-    Spacing,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Orientationd,
+    Spacingd,
 )
 
 from src import UHVED
@@ -97,6 +97,8 @@ def load_uhved_from_checkpoint(checkpoint_path, device="cuda"):
     print(f"  - Scales: {num_scales}")
 
     # Create model
+    # Note: reconstruct_orientations must match the checkpoint architecture
+    # If checkpoint was trained with MultiOutputDecoder, set to True
     model = UHVED(
         num_orientations=num_orientations,
         in_channels=1,
@@ -105,11 +107,20 @@ def load_uhved_from_checkpoint(checkpoint_path, device="cuda"):
         num_scales=num_scales,
         share_encoder=False,
         share_decoder=False,
-        reconstruct_orientations=False,  # Disable for inference
+        reconstruct_orientations=True,  # Must match checkpoint architecture
     )
 
+    # Remap checkpoint keys for backward compatibility
+    # Old checkpoints use 'modality_decoders', new code uses 'orientation_decoders'
+    state_dict = checkpoint['model_state_dict']
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        # Replace modality_decoders with orientation_decoders
+        new_key = key.replace('modality_decoders', 'orientation_decoders')
+        new_state_dict[new_key] = value
+
     # Load weights
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(new_state_dict)
     model = model.to(device)
     model.eval()
 
@@ -128,10 +139,10 @@ def create_inference_transforms(target_res=[1.0, 1.0, 1.0]):
         MONAI Compose transform
     """
     return Compose([
-        LoadImage(image_only=False),
-        EnsureChannelFirst(),
-        Orientation(axcodes="RAS"),
-        Spacing(pixdim=target_res, mode="bilinear"),
+        LoadImaged(keys=["image"], image_only=True),
+        EnsureChannelFirstd(keys=["image"]),
+        Orientationd(keys=["image"], axcodes="RAS", labels=None),
+        Spacingd(keys=["image"], pixdim=target_res, mode="bilinear"),
     ])
 
 
@@ -169,15 +180,12 @@ def load_orthogonal_stacks_from_files(stack_paths, target_res=[1.0, 1.0, 1.0]):
         print(f"    - {stack_num} ({orientation}): {stack_path}")
         print(f"      └─ {description}")
 
-        # Load and preprocess
-        data = transforms(stack_path)
+        # Load and preprocess with dictionary-based transforms
+        data_dict = {"image": stack_path}
+        data = transforms(data_dict)
 
-        # Extract volume and metadata
-        if isinstance(data, tuple):
-            volume, meta = data[0], data[1] if len(data) > 1 else {}
-        else:
-            volume = data
-            meta = {}
+        # Extract volume (dictionary-based transforms return dict)
+        volume = data["image"]
 
         # Convert to numpy if tensor
         if isinstance(volume, torch.Tensor):
@@ -197,17 +205,12 @@ def load_orthogonal_stacks_from_files(stack_paths, target_res=[1.0, 1.0, 1.0]):
 
         # Get affine from first stack
         if affine is None:
-            if hasattr(meta, 'get') and 'affine' in meta:
-                affine = meta['affine']
-                if isinstance(affine, torch.Tensor):
-                    affine = affine.cpu().numpy()
-            else:
-                # Try loading from original file
-                try:
-                    original_img = nib.load(stack_path)
-                    affine = original_img.affine.copy()
-                except:
-                    affine = np.diag([target_res[0], target_res[1], target_res[2], 1.0])
+            # Try loading from original file
+            try:
+                original_img = nib.load(stack_path)
+                affine = original_img.affine.copy()
+            except:
+                affine = np.diag([target_res[0], target_res[1], target_res[2], 1.0])
 
     print(f"    Stack shapes: {[s.shape for s in lr_stacks_tensors]}")
     return lr_stacks_tensors, affine
@@ -218,32 +221,31 @@ def generate_orthogonal_stacks(hr_volume, generator):
     Generate 3 orthogonal LR stacks from HR volume.
 
     Args:
-        hr_volume: High-resolution volume (D, H, W)
+        hr_volume: High-resolution volume (D, H, W) or (C, D, H, W)
         generator: HRLRDataGenerator instance
 
     Returns:
-        List of 3 LR stacks (each as tensor)
+        List of 3 LR stacks (each as tensor with shape (C, D, H, W))
     """
-    # Generate orthogonal stacks using the data generator
-    # The generator expects numpy array input
-    if isinstance(hr_volume, torch.Tensor):
-        hr_volume_np = hr_volume.cpu().numpy()
-    else:
-        hr_volume_np = np.array(hr_volume)
+    # Convert to tensor if needed
+    if isinstance(hr_volume, np.ndarray):
+        hr_volume = torch.from_numpy(hr_volume).float()
 
-    # Remove channel dimension if present
-    if hr_volume_np.ndim == 4 and hr_volume_np.shape[0] == 1:
-        hr_volume_np = hr_volume_np[0]
+    # Ensure we have batch and channel dimensions: (B, C, D, H, W)
+    if hr_volume.ndim == 3:
+        # (D, H, W) -> (1, 1, D, H, W)
+        hr_volume = hr_volume.unsqueeze(0).unsqueeze(0)
+    elif hr_volume.ndim == 4:
+        # (C, D, H, W) -> (1, C, D, H, W)
+        hr_volume = hr_volume.unsqueeze(0)
 
     # Generate orthogonal stacks (simulates acquisition)
     # This uses the same degradation pipeline as training
-    lr_stacks, _ = generator.generate_orthogonal_stacks(hr_volume_np)
+    lr_stacks_list, _, orientation_mask = generator.generate_paired_data(hr_volume, return_resolution=False)
 
-    # Convert to tensors with channel dimension
-    lr_stacks_tensors = [
-        torch.from_numpy(stack).float().unsqueeze(0)  # Add channel dim
-        for stack in lr_stacks
-    ]
+    # lr_stacks_list is a list of 3 tensors, each with shape (B, C, D, H, W)
+    # Remove batch dimension and return as list
+    lr_stacks_tensors = [stack.squeeze(0) for stack in lr_stacks_list]
 
     return lr_stacks_tensors
 
@@ -292,14 +294,11 @@ def predict_single_volume(
         # Load and preprocess with MONAI
         print("  Loading and preprocessing...")
         transforms = create_inference_transforms(target_res)
-        data = transforms(input_path)
+        data_dict = {"image": input_path}
+        data = transforms(data_dict)
 
-        # Extract volume and metadata
-        if isinstance(data, tuple):
-            volume, meta = data[0], data[1] if len(data) > 1 else {}
-        else:
-            volume = data
-            meta = {}
+        # Extract volume (dictionary-based transforms return dict)
+        volume = data["image"]
 
         # Convert to numpy if tensor
         if isinstance(volume, torch.Tensor):
@@ -314,20 +313,13 @@ def predict_single_volume(
         print(f"  Input shape: {volume_np.shape}")
 
         # Get affine for saving
-        affine = None
-        if hasattr(meta, 'get') and 'affine' in meta:
-            affine = meta['affine']
-            if isinstance(affine, torch.Tensor):
-                affine = affine.cpu().numpy()
-
-        if affine is None:
-            # Load affine from original file
-            try:
-                original_img = nib.load(input_path)
-                affine = original_img.affine.copy()
-            except:
-                # Fallback to identity
-                affine = np.diag([target_res[0], target_res[1], target_res[2], 1.0])
+        # Load affine from original file
+        try:
+            original_img = nib.load(input_path)
+            affine = original_img.affine.copy()
+        except:
+            # Fallback to identity
+            affine = np.diag([target_res[0], target_res[1], target_res[2], 1.0])
 
         # Normalize to [0, 1]
         volume_np = (volume_np - volume_np.min()) / (volume_np.max() - volume_np.min() + 1e-8)

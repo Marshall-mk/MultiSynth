@@ -94,6 +94,8 @@ def train_uhved_model(
     use_sliding_window_val: bool = False,
     val_patch_size: tuple = (128, 128, 128),
     val_overlap: float = 0.5,
+    final_activation: str = "sigmoid",
+    max_grad_norm: float = 1.0,
 ):
     """
     Train U-HVED model with orthogonal LR stacks
@@ -145,6 +147,8 @@ def train_uhved_model(
         use_sliding_window_val: Use sliding window inference for validation
         val_patch_size: Patch size for sliding window validation
         val_overlap: Overlap ratio for sliding window validation
+        final_activation: Final activation function ('tanh', 'sigmoid', or 'none')
+        max_grad_norm: Maximum gradient norm for clipping (0 to disable)
     """
     # Initialize Accelerator for multi-GPU training
     accelerator = Accelerator(
@@ -288,6 +292,7 @@ def train_uhved_model(
         print(f"  - Number of orientations: 3 (orthogonal stacks)")
         print(f"  - Base channels: {base_channels}")
         print(f"  - Number of scales: {num_scales}")
+        print(f"  - Final activation: {final_activation}")
 
     model = UHVED(
         num_orientations=3,  # Fixed: axial, coronal, sagittal
@@ -298,6 +303,7 @@ def train_uhved_model(
         share_encoder=False,  # Independent encoders for each orientation
         share_decoder=False,
         reconstruct_orientations=True,  # Reconstruct input orientations for training
+        final_activation=final_activation,
     )
 
     # Load checkpoint weights if available
@@ -337,6 +343,10 @@ def train_uhved_model(
 
     if accelerator.is_main_process:
         print(f"Using Cosine LR schedule with warmup ({warmup_steps} warmup steps, {num_steps} total steps)")
+        if max_grad_norm > 0:
+            print(f"Gradient clipping enabled: max_norm={max_grad_norm}")
+        else:
+            print(f"Gradient clipping disabled")
 
     # Load optimizer and scheduler state if resuming
     if checkpoint_data is not None:
@@ -475,14 +485,50 @@ def train_uhved_model(
                 optimizer.zero_grad()
                 accelerator.backward(loss)
 
-                # Gradient clipping
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                # Gradient clipping (works with both Accelerate and single GPU)
+                if max_grad_norm > 0:
+                    if accelerator.sync_gradients:
+                        # Multi-GPU: Use Accelerate's method
+                        accelerator.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                    else:
+                        # Single GPU or no sync needed: Use PyTorch's method
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
 
                 optimizer.step()
                 scheduler.step()
 
             epoch_loss += loss.item()
+
+            # Early NaN detection
+            if not torch.isfinite(loss):
+                accelerator.print(f"\n{'='*80}")
+                accelerator.print(f"CRITICAL: NaN/Inf detected in loss at epoch {epoch+1}, batch {batch_idx}")
+                accelerator.print(f"Loss value: {loss.item()}")
+                accelerator.print(f"Learning rate: {optimizer.param_groups[0]['lr']:.2e}")
+
+                # Print gradient statistics
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+                accelerator.print(f"Gradient norm: {total_norm:.4f}")
+
+                accelerator.print(f"{'='*80}\n")
+
+                # Optionally save checkpoint for debugging
+                if accelerator.is_main_process:
+                    debug_path = os.path.join(model_dir, f"debug_nan_epoch_{epoch+1}_batch_{batch_idx}.pth")
+                    torch.save({
+                        'model_state_dict': accelerator.unwrap_model(model).state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'epoch': epoch,
+                        'batch_idx': batch_idx,
+                        'loss': loss.item(),
+                    }, debug_path)
+                    accelerator.print(f"Saved debug checkpoint: {debug_path}")
+
             epoch_recon_loss += losses['reconstruction'].item()
             epoch_kl_loss += losses['kl'].item()
             epoch_ssim_loss += losses['ssim'].item() if 'ssim' in losses else 0.0
@@ -870,6 +916,14 @@ if __name__ == "__main__":
     parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--final_activation", type=str, default="sigmoid",
+                       choices=["tanh", "sigmoid", "none"],
+                       help="Final activation function for decoder outputs. "
+                            "Use 'sigmoid' for [0,1] normalized inputs (default), "
+                            "'tanh' for [-1,1] normalized inputs, "
+                            "or 'none' for no activation.")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                       help="Maximum gradient norm for clipping. Set to 0 to disable. Default: 1.0")
 
     args = parser.parse_args()
 
@@ -963,4 +1017,6 @@ if __name__ == "__main__":
         use_sliding_window_val=args.use_sliding_window_val,
         val_patch_size=tuple(args.val_patch_size),
         val_overlap=args.val_overlap,
+        final_activation=args.final_activation,
+        max_grad_norm=args.max_grad_norm,
     )

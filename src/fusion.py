@@ -108,7 +108,9 @@ class ProductOfGaussians(nn.Module):
                 batch_mask = 1.0
 
             # Compute precision (inverse variance)
-            precision = 1.0 / (torch.exp(logvar) + self.eps)
+            # Clamp logvar to prevent overflow/underflow: exp(-20) to exp(20)
+            logvar_clamped = torch.clamp(logvar, min=-20.0, max=20.0)
+            precision = 1.0 / (torch.exp(logvar_clamped) + self.eps)
 
             # Apply mask to precision (zeros out contribution from masked batch elements)
             if isinstance(batch_mask, torch.Tensor):
@@ -131,6 +133,9 @@ class ProductOfGaussians(nn.Module):
         posterior_var = 1.0 / (precision_sum + self.eps)
         posterior_mu = weighted_mu_sum * posterior_var
         posterior_logvar = torch.log(posterior_var + self.eps)
+
+        # Safety: Clamp output to prevent NaN propagation
+        posterior_logvar = torch.clamp(posterior_logvar, min=-20.0, max=20.0)
 
         return posterior_mu, posterior_logvar
 
@@ -167,7 +172,9 @@ class GaussianSampler(nn.Module):
             return mu
 
         # Reparameterization trick
-        std = torch.exp(0.5 * logvar)
+        # Clamp logvar to prevent overflow: exp(0.5 * 20) is still manageable
+        logvar_clamped = torch.clamp(logvar, min=-20.0, max=20.0)
+        std = torch.exp(0.5 * logvar_clamped)
         noise = torch.randn_like(mu)
         return mu + std * noise
 

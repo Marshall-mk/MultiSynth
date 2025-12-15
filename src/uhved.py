@@ -59,7 +59,8 @@ class UHVED(nn.Module):
         use_prior: bool = True,
         activation: str = 'leakyrelu',
         upsample_mode: str = 'trilinear',
-        reconstruct_orientations: bool = True
+        reconstruct_orientations: bool = True,
+        final_activation: str = 'sigmoid'
     ):
         """
         Args:
@@ -74,6 +75,7 @@ class UHVED(nn.Module):
             activation: Activation function type
             upsample_mode: Upsampling strategy in decoder
             reconstruct_orientations: Whether to reconstruct input orientations
+            final_activation: Final output activation ('tanh', 'sigmoid', or 'none')
         """
         super().__init__()
 
@@ -106,7 +108,8 @@ class UHVED(nn.Module):
                 num_scales=num_scales,
                 upsample_mode=upsample_mode,
                 activation=activation,
-                share_decoder=share_decoder
+                share_decoder=share_decoder,
+                final_activation=final_activation
             )
         else:
             self.decoder = ConvDecoder(
@@ -114,7 +117,8 @@ class UHVED(nn.Module):
                 base_channels=base_channels,
                 num_scales=num_scales,
                 upsample_mode=upsample_mode,
-                activation=activation
+                activation=activation,
+                final_activation=final_activation
             )
 
         # Store dimensions for external reference
@@ -332,7 +336,8 @@ class UHVEDWithUpscale(nn.Module):
         out_channels: int = 1,
         base_channels: int = 32,
         num_scales: int = 4,
-        upscale_factor: int = 4
+        upscale_factor: int = 4,
+        final_activation: str = 'sigmoid'
     ):
         """
         Args:
@@ -342,10 +347,12 @@ class UHVEDWithUpscale(nn.Module):
             base_channels: Base channel count
             num_scales: Number of scales
             upscale_factor: Final upscaling factor (2, 4, or 8)
+            final_activation: Final output activation ('tanh', 'sigmoid', or 'none')
         """
         super().__init__()
 
         self.upscale_factor = upscale_factor
+        self.final_activation = final_activation
 
         # Base U-HVED
         self.uhved = UHVED(
@@ -379,7 +386,13 @@ class UHVEDWithUpscale(nn.Module):
             remaining //= 2
 
         layers.append(nn.Conv3d(in_channels, out_channels, 3, 1, 1))
-        layers.append(nn.Tanh())
+
+        # Add configurable final activation
+        if self.final_activation == 'tanh':
+            layers.append(nn.Tanh())
+        elif self.final_activation == 'sigmoid':
+            layers.append(nn.Sigmoid())
+        # else: no activation for 'none'
 
         return nn.Sequential(*layers)
 

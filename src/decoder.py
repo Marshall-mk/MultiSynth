@@ -313,7 +313,8 @@ class MultiOutputDecoder(nn.Module):
         num_scales: int = 4,
         upsample_mode: str = 'bilinear',
         activation: str = 'leakyrelu',
-        share_decoder: bool = False
+        share_decoder: bool = False,
+        final_activation: str = 'sigmoid'
     ):
         """
         Args:
@@ -324,6 +325,7 @@ class MultiOutputDecoder(nn.Module):
             upsample_mode: Upsampling strategy
             activation: Activation function
             share_decoder: If True, share decoder weights across orientations
+            final_activation: Final output activation ('tanh', 'sigmoid', or 'none')
         """
         super().__init__()
 
@@ -337,7 +339,7 @@ class MultiOutputDecoder(nn.Module):
             num_scales=num_scales,
             upsample_mode=upsample_mode,
             activation=activation,
-            final_activation='tanh'
+            final_activation=final_activation
         )
 
         # Orientation reconstruction decoders
@@ -348,7 +350,7 @@ class MultiOutputDecoder(nn.Module):
                 num_scales=num_scales,
                 upsample_mode=upsample_mode,
                 activation=activation,
-                final_activation='tanh'
+                final_activation=final_activation
             )
         else:
             self.orientation_decoders = nn.ModuleList([
@@ -358,7 +360,7 @@ class MultiOutputDecoder(nn.Module):
                     num_scales=num_scales,
                     upsample_mode=upsample_mode,
                     activation=activation,
-                    final_activation='tanh'
+                    final_activation=final_activation
                 )
                 for _ in range(num_orientations)
             ])

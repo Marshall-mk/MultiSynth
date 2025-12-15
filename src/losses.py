@@ -53,7 +53,9 @@ class KLDivergence(nn.Module):
         Returns:
             KL divergence loss
         """
-        kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+        # Clamp logvar before exp to prevent overflow
+        logvar_clamped = torch.clamp(logvar, min=-20.0, max=20.0)
+        kl = -0.5 * (1 + logvar_clamped - mu.pow(2) - logvar_clamped.exp())
 
         if self.reduction == 'mean':
             return kl.mean()
@@ -739,6 +741,31 @@ class UHVEDLoss(nn.Module):
 
         # Total loss
         total_loss = sum(losses.values())
+
+        # NaN/Inf detection and debugging
+        if not torch.isfinite(total_loss):
+            print("\n" + "="*80)
+            print("WARNING: NaN or Inf detected in loss!")
+            print("="*80)
+            for loss_name, loss_value in losses.items():
+                finite = torch.isfinite(loss_value).item() if torch.is_tensor(loss_value) else True
+                print(f"{loss_name}: {loss_value.item() if torch.is_tensor(loss_value) else loss_value} "
+                      f"(finite: {finite})")
+
+            # Check inputs
+            print(f"\nInput statistics:")
+            print(f"  sr_output: min={sr_output.min().item():.4f}, max={sr_output.max().item():.4f}, "
+                  f"mean={sr_output.mean().item():.4f}, has_nan={torch.isnan(sr_output).any().item()}")
+            print(f"  sr_target: min={sr_target.min().item():.4f}, max={sr_target.max().item():.4f}, "
+                  f"mean={sr_target.mean().item():.4f}, has_nan={torch.isnan(sr_target).any().item()}")
+
+            # Check posteriors
+            if posteriors:
+                print(f"\nPosterior statistics:")
+                for i, (mu, logvar) in enumerate(posteriors):
+                    print(f"  Scale {i}: mu range=[{mu.min().item():.4f}, {mu.max().item():.4f}], "
+                          f"logvar range=[{logvar.min().item():.4f}, {logvar.max().item():.4f}]")
+            print("="*80 + "\n")
 
         # Update step counter
         if self.training:

@@ -394,6 +394,18 @@ class MultiOutputDecoder(nn.Module):
                     mod_out = self.orientation_decoder(latent_samples, skip_features)
                 else:
                     mod_out = self.orientation_decoders[i](latent_samples, skip_features)
+
+                # DEBUG -> Check for NaN in orientation decoder output
+                if self.training and (not torch.isfinite(mod_out).all()):
+                    print(f"\n{'='*80}")
+                    print(f"CRITICAL: Orientation decoder {i} produced NaN/Inf!")
+                    print(f"  This indicates weight explosion in orientation_decoders[{i}]")
+                    print(f"  SR decoder works fine, but this orientation decoder has diverged")
+                    print(f"  Output: min={mod_out.min().item():.4f}, max={mod_out.max().item():.4f}, "
+                          f"mean={mod_out.mean().item():.4f}")
+                    print(f"  has_nan={torch.isnan(mod_out).any().item()}, has_inf={torch.isinf(mod_out).any().item()}")
+                    print(f"{'='*80}\n")
+
                 orientation_outputs.append(mod_out)
 
         return sr_output, orientation_outputs

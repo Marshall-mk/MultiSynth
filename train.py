@@ -71,6 +71,7 @@ def train_uhved_model(
     apply_intensity_aug: bool = True,
     orientation_dropout_prob: float = 0.0,
     min_orientations: int = 1,
+    drop_orientations: list = None,
     num_workers: int = None,
     use_cache: bool = False,
     use_wandb: bool = False,
@@ -94,8 +95,12 @@ def train_uhved_model(
     use_sliding_window_val: bool = False,
     val_patch_size: tuple = (128, 128, 128),
     val_overlap: float = 0.5,
+    use_prior: bool = False,
+    use_encoder_outputs_as_skip: bool = False,
+    reconstruct_orientations: bool = True,
     final_activation: str = "sigmoid",
     max_grad_norm: float = 1.0,
+    decoder_upsample_mode: str = "trilinear",
 ):
     """
     Train U-HVED model with orthogonal LR stacks
@@ -124,6 +129,7 @@ def train_uhved_model(
         apply_intensity_aug: Whether to apply intensity augmentation
         orientation_dropout_prob: Probability of applying orientation dropout (0.0-1.0)
         min_orientations: Minimum number of orientations to keep after dropout (1-3)
+        drop_orientations: Specific orientations to drop (0=Axial, 1=Coronal, 2=Sagittal). If specified, always drops these.
         num_workers: Number of data loading workers
         use_cache: Whether to use CacheDataset
         use_wandb: Whether to use Weights & Biases for tracking
@@ -147,8 +153,11 @@ def train_uhved_model(
         use_sliding_window_val: Use sliding window inference for validation
         val_patch_size: Patch size for sliding window validation
         val_overlap: Overlap ratio for sliding window validation
+        use_prior: Whether to use prior in U-HVED model
+        use_encoder_outputs_as_skip: Whether to use encoder features as skip connections
         final_activation: Final activation function ('tanh', 'sigmoid', or 'none')
         max_grad_norm: Maximum gradient norm for clipping (0 to disable)
+        decoder_upsample_mode: Decoder upsampling strategy ('trilinear', 'transpose', or 'pixelshuffle')
     """
     # Initialize Accelerator for multi-GPU training
     accelerator = Accelerator(
@@ -218,6 +227,10 @@ def train_uhved_model(
         clip_to_unit_range=True,
         orientation_dropout_prob=orientation_dropout_prob,
         min_orientations=min_orientations,
+        drop_orientations=drop_orientations,
+        upsample_mode=upsample_mode,
+        save_lr_stacks=save_lr_stacks,
+        lr_stack_output_dir=lr_stack_output_dir,
     )
 
     # Create dataset
@@ -286,6 +299,22 @@ def train_uhved_model(
         if accelerator.is_main_process:
             print(f"Resuming training from epoch {start_epoch}")
 
+    # Validate checkpoint compatibility with reconstruct_orientations setting
+    if checkpoint_data is not None:
+        checkpoint_model_config = checkpoint_data.get('model_config', {})
+        checkpoint_reconstruct_orientations = checkpoint_model_config.get(
+            'reconstruct_orientations', True  # Default to True for old checkpoints
+        )
+
+        if checkpoint_reconstruct_orientations != reconstruct_orientations:
+            raise ValueError(
+                f"\nCheckpoint architecture mismatch!\n"
+                f"  Checkpoint: reconstruct_orientations={checkpoint_reconstruct_orientations}\n"
+                f"  Current: reconstruct_orientations={reconstruct_orientations}\n"
+                f"  Hint: {'Add' if checkpoint_reconstruct_orientations else 'Remove'} "
+                f"--no_reconstruct_orientations flag to match checkpoint."
+            )
+
     # Create U-HVED model
     if accelerator.is_main_process:
         print(f"Creating U-HVED model:")
@@ -302,8 +331,11 @@ def train_uhved_model(
         num_scales=num_scales,
         share_encoder=False,  # Independent encoders for each orientation
         share_decoder=False,
-        reconstruct_orientations=True,  # Reconstruct input orientations for training
+        use_prior=use_prior,
+        use_encoder_outputs_as_skip=use_encoder_outputs_as_skip,  # Use encoder features as skip connections
+        reconstruct_orientations=reconstruct_orientations,  # Control orientation reconstruction for ablations
         final_activation=final_activation,
+        upsample_mode=decoder_upsample_mode,
     )
 
     # Load checkpoint weights if available
@@ -312,8 +344,8 @@ def train_uhved_model(
         if accelerator.is_main_process:
             print(f"✓ Loaded model weights from checkpoint")
 
-    # Optimizer and loss
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    # Optimizer and loss - Add weight decay to prevent unbounded weight growth
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
 
     criterion = UHVEDLoss(
         recon_loss_type=recon_loss_type,
@@ -371,7 +403,13 @@ def train_uhved_model(
             (batch_size, 1, *output_shape),  # Coronal stack
             (batch_size, 1, *output_shape),  # Sagittal stack
         ]
-        print_model_statistics(accelerator.unwrap_model(model), input_shapes, device=str(accelerator.device))
+        print_model_statistics(
+            accelerator.unwrap_model(model),
+            input_shapes,
+            device=str(accelerator.device),
+            base_channels=base_channels,
+            num_scales=num_scales
+        )
         print(f"\nTraining for {epochs} epochs, batch size {batch_size}")
         print(f"Initial learning rate: {learning_rate}")
         print(f"Device: {accelerator.device}")
@@ -397,6 +435,7 @@ def train_uhved_model(
             "kl_weight": kl_weight,
             "perceptual_weight": perceptual_weight,
             "orientation_weight": orientation_weight,
+            "reconstruct_orientations": reconstruct_orientations,
             "model_parameters": sum(p.numel() for p in model.parameters()),
             "n_train_samples": len(hr_image_paths),
             "n_val_samples": len(val_image_paths) if val_image_paths else 0,
@@ -423,7 +462,10 @@ def train_uhved_model(
         csv_headers = ["epoch", "train_loss", "train_recon", "train_kl", "train_ssim", "train_perceptual", "train_orientation",
                         "learning_rate", "epoch_time"]
         if val_dataloader:
-            csv_headers.extend(["val_loss", "val_mae", "val_mse", "val_rmse", "val_psnr", "val_r2", "val_ssim", "validation_time"])
+            csv_headers.extend([
+                "val_loss", "val_recon", "val_kl", "val_ssim_loss", "val_perceptual", "val_orientation",
+                "val_mae", "val_mse", "val_rmse", "val_psnr", "val_r2", "val_ssim", "validation_time"
+            ])
 
         csv_file = open(csv_path, mode='a', newline='')
         csv_writer = csv.DictWriter(csv_file, fieldnames=csv_headers)
@@ -446,17 +488,14 @@ def train_uhved_model(
             dataloader,
             desc=f"Epoch {epoch + 1}/{epochs}",
             disable=not accelerator.is_main_process,
-            leave=False,  # Don't leave progress bar after completion
-            dynamic_ncols=True,  # Adjust width dynamically
+            leave=False,  
+            dynamic_ncols=True,  
         )
 
         for batch_idx, batch_data in enumerate(pbar):
             # Unpack batch: (lr_stacks_list, hr, resolutions_list, thicknesses_list, orientation_mask)
             lr_stacks_list, target_img, resolutions_list, thicknesses_list, orientation_mask = batch_data
-
-            # lr_stacks_list is a list of 3 tensors, each (B, C, D, H, W)
-            # We need to convert to the format U-HVED expects: list of (B, C, D, H, W)
-            orientations = lr_stacks_list  # Already in correct format
+            orientations = lr_stacks_list
 
             # Ensure consistent dtype
             orientations = [m.float() for m in orientations]
@@ -464,9 +503,6 @@ def train_uhved_model(
 
             # Forward and backward pass
             with accelerator.accumulate(model):
-                # Pass orientation_mask to the model's fusion mechanism
-                # The mask indicates which orientations are present for each sample
-                # The fusion will exclude masked-out orientations from Product of Gaussians
                 outputs = model(orientations, orientation_mask=orientation_mask)
 
                 # Compute loss
@@ -499,7 +535,7 @@ def train_uhved_model(
 
             epoch_loss += loss.item()
 
-            # Early NaN detection
+            # DEBUG -> Early NaN detection
             if not torch.isfinite(loss):
                 accelerator.print(f"\n{'='*80}")
                 accelerator.print(f"CRITICAL: NaN/Inf detected in loss at epoch {epoch+1}, batch {batch_idx}")
@@ -516,18 +552,6 @@ def train_uhved_model(
                 accelerator.print(f"Gradient norm: {total_norm:.4f}")
 
                 accelerator.print(f"{'='*80}\n")
-
-                # Optionally save checkpoint for debugging
-                if accelerator.is_main_process:
-                    debug_path = os.path.join(model_dir, f"debug_nan_epoch_{epoch+1}_batch_{batch_idx}.pth")
-                    torch.save({
-                        'model_state_dict': accelerator.unwrap_model(model).state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'epoch': epoch,
-                        'batch_idx': batch_idx,
-                        'loss': loss.item(),
-                    }, debug_path)
-                    accelerator.print(f"Saved debug checkpoint: {debug_path}")
 
             epoch_recon_loss += losses['reconstruction'].item()
             epoch_kl_loss += losses['kl'].item()
@@ -547,7 +571,7 @@ def train_uhved_model(
                 "lr": f"{current_lr:.2e}"
             }
 
-            # Add GPU memory to progress bar (update every 10 batches to avoid overhead)
+            # DEBUG -> Add GPU memory to progress bar (update every 10 batches to avoid overhead)
             if batch_idx % 10 == 0:
                 mem_stats = get_gpu_memory_stats(accelerator.device)
                 if mem_stats:
@@ -555,7 +579,7 @@ def train_uhved_model(
 
             pbar.set_postfix(postfix_dict)
 
-            # Print actual GPU memory usage after first batch (once per training run)
+            # DEBUG -> Print actual GPU memory usage after first batch (once per training run)
             if epoch == start_epoch and batch_idx == 0 and accelerator.is_main_process:
                 print()  # New line after progress bar
                 print_gpu_memory_stats(accelerator.device, prefix="After first batch")
@@ -578,6 +602,11 @@ def train_uhved_model(
             val_epoch_loss = 0.0
             metrics_sum = {"mae": 0.0, "mse": 0.0, "rmse": 0.0, "psnr": 0.0, "r2": 0.0, "ssim": 0.0}
             num_val_batches = 0
+            val_recon_losses = 0.0
+            val_kl_losses = 0.0
+            val_ssim_losses = 0.0
+            val_perceptual_losses = 0.0
+            val_orientation_losses = 0.0
 
             with torch.no_grad():
                 for val_batch_data in val_dataloader:
@@ -612,6 +641,11 @@ def train_uhved_model(
                     )
 
                     val_epoch_loss += losses['total'].item()
+                    val_recon_losses += losses['reconstruction'].item()
+                    val_kl_losses += losses['kl'].item()
+                    val_ssim_losses += losses['ssim'].item()
+                    val_perceptual_losses += losses['perceptual'].item()
+                    val_orientation_losses += losses['orientation'].item()
 
                     # Calculate metrics
                     batch_metrics = calculate_metrics(outputs['sr_output'], target_img, max_val=1.0)
@@ -621,13 +655,26 @@ def train_uhved_model(
 
             val_loss = val_epoch_loss / num_val_batches
             val_metrics = {k: v / num_val_batches for k, v in metrics_sum.items()}
+            val_loss_components = {
+                'val_recon': val_recon_losses / num_val_batches,
+                'val_kl': val_kl_losses / num_val_batches,
+                'val_ssim_loss': val_ssim_losses / num_val_batches,
+                'val_perceptual': val_perceptual_losses / num_val_batches,
+                'val_orientation': val_orientation_losses / num_val_batches,
+            }
             validation_time = time.time() - val_start_time
 
             epoch_time = time.time() - epoch_start_time
-            # Print validation results (use accelerator.print to avoid tqdm interference)
+            # Print validation results 
             accelerator.print(
                 f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_loss:.4f} "
-                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, orientation: {avg_orientation:.4f}) - Val Loss: {val_loss:.4f}"
+                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, Orient: {avg_orientation:.4f})"
+            )
+            accelerator.print(
+                f"  Val Loss: {val_loss:.4f} "
+                f"(Recon: {val_loss_components['val_recon']:.4f}, KL: {val_loss_components['val_kl']:.6f}, "
+                f"SSIM: {val_loss_components['val_ssim_loss']:.4f}, Percep: {val_loss_components['val_perceptual']:.4f}, "
+                f"Orient: {val_loss_components['val_orientation']:.4f})"
             )
             accelerator.print(
                 f"  Val Metrics - MAE: {val_metrics['mae']:.4f} | RMSE: {val_metrics['rmse']:.4f} | "
@@ -636,7 +683,7 @@ def train_uhved_model(
             )
         else:
             epoch_time = time.time() - epoch_start_time
-            # Print training summary (use accelerator.print to avoid tqdm interference)
+            # Print training summary 
             accelerator.print(
                 f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f} "
                 f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, orientation: {avg_orientation:.4f}) - LR: {current_lr:.2e}"
@@ -658,6 +705,11 @@ def train_uhved_model(
             if val_loss is not None and val_metrics is not None:
                 log_data.update({
                     "val_loss": val_loss,
+                    "val_recon": val_loss_components['val_recon'],
+                    "val_kl": val_loss_components['val_kl'],
+                    "val_ssim_loss": val_loss_components['val_ssim_loss'],
+                    "val_perceptual": val_loss_components['val_perceptual'],
+                    "val_orientation": val_loss_components['val_orientation'],
                     "val_mae": val_metrics['mae'],
                     "val_mse": val_metrics['mse'],
                     "val_rmse": val_metrics['rmse'],
@@ -684,6 +736,11 @@ def train_uhved_model(
             if val_loss is not None and val_metrics is not None:
                 wandb_log_data.update({
                     "val/loss": val_loss,
+                    "val/recon": val_loss_components['val_recon'],
+                    "val/kl": val_loss_components['val_kl'],
+                    "val/ssim_loss": val_loss_components['val_ssim_loss'],
+                    "val/perceptual": val_loss_components['val_perceptual'],
+                    "val/orientation": val_loss_components['val_orientation'],
                     "val/mae": val_metrics['mae'],
                     "val/mse": val_metrics['mse'],
                     "val/rmse": val_metrics['rmse'],
@@ -692,6 +749,20 @@ def train_uhved_model(
                     "val/ssim": val_metrics['ssim'],
                 })
             wandb.log(wandb_log_data)
+
+        # DEBUG -> Monitor weight norms every 10 epochs to detect potential instability early
+        if accelerator.is_main_process and (epoch + 1) % 10 == 0:
+            max_weight_norm = 0.0
+            max_weight_layer = ""
+            for name, param in accelerator.unwrap_model(model).named_parameters():
+                if param.requires_grad and 'weight' in name:
+                    param_norm = param.data.norm(2).item()
+                    if param_norm > max_weight_norm:
+                        max_weight_norm = param_norm
+                        max_weight_layer = name
+            accelerator.print(f"  Weight monitoring - Max norm: {max_weight_norm:.2f} in layer: {max_weight_layer}")
+            if max_weight_norm > 100.0:
+                accelerator.print(f"  ⚠️  WARNING: Large weight norm detected! Consider early stopping or reducing learning rate.")
 
         # Save best model if validation loss improved
         if val_loss is not None and val_loss < best_val_loss:
@@ -706,6 +777,16 @@ def train_uhved_model(
                     "base_channels": base_channels,
                     "num_scales": num_scales,
                     "output_shape": output_shape,
+                    "reconstruct_orientations": reconstruct_orientations,
+                    "use_prior": use_prior,
+                    "use_encoder_outputs_as_skip": use_encoder_outputs_as_skip,
+                    "decoder_upsample_mode": decoder_upsample_mode,
+                    "final_activation": final_activation,
+                    "share_encoder": False,
+                    "share_decoder": False,
+                    "activation": 'leakyrelu',
+                    "in_channels": 1,
+                    "out_channels": 1,
                 }
 
                 training_config = {
@@ -747,6 +828,16 @@ def train_uhved_model(
                     "base_channels": base_channels,
                     "num_scales": num_scales,
                     "output_shape": output_shape,
+                    "reconstruct_orientations": reconstruct_orientations,
+                    "use_prior": use_prior,
+                    "use_encoder_outputs_as_skip": use_encoder_outputs_as_skip,
+                    "decoder_upsample_mode": decoder_upsample_mode,
+                    "final_activation": final_activation,
+                    "share_encoder": False,
+                    "share_decoder": False,
+                    "activation": 'leakyrelu',
+                    "in_channels": 1,
+                    "out_channels": 1,
                 }
 
                 training_config = {
@@ -786,6 +877,16 @@ def train_uhved_model(
             "base_channels": base_channels,
             "num_scales": num_scales,
             "output_shape": output_shape,
+            "reconstruct_orientations": reconstruct_orientations,
+            "use_prior": use_prior,
+            "use_encoder_outputs_as_skip": use_encoder_outputs_as_skip,
+            "decoder_upsample_mode": decoder_upsample_mode,
+            "final_activation": final_activation,
+            "share_encoder": False,
+            "share_decoder": False,
+            "activation": 'leakyrelu',
+            "in_channels": 1,
+            "out_channels": 1,
         }
 
         training_config = {
@@ -855,6 +956,16 @@ if __name__ == "__main__":
     # Model parameters
     parser.add_argument("--base_channels", type=int, default=32, help="Base channels for U-HVED")
     parser.add_argument("--num_scales", type=int, default=4, help="Number of hierarchical scales")
+    parser.add_argument("--final_activation", type=str, default="sigmoid", choices=["sigmoid", "tanh", "none"],
+                        help="Final activation function")
+    parser.add_argument("--use_prior", action="store_true", help="Use learned prior in latent space")
+    parser.add_argument("--use_encoder_outputs_as_skip", action="store_true",
+                        help="Use encoder outputs as skip connections in decoder")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping (0 to disable)")
+    parser.add_argument("--decoder_upsample_mode", type=str, default="trilinear",
+                        choices=["trilinear", "transpose", "pixelshuffle"],
+                        help="Decoder upsampling strategy: trilinear (interpolation+conv), "
+                             "transpose (transposed conv), or pixelshuffle (sub-pixel conv)")
 
     # Training parameters
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
@@ -895,6 +1006,24 @@ if __name__ == "__main__":
     parser.add_argument("--min_orientations", type=int, default=1,
                         help="Minimum number of orientations to keep after dropout (1-3). "
                              "Default: 1 (allows training with single views)")
+    parser.add_argument("--drop_orientations", type=int, nargs="+", default=None,
+                        choices=[0, 1, 2],
+                        help="Specific orientations to drop (0=Axial, 1=Coronal, 2=Sagittal). "
+                             "If specified, these orientations will ALWAYS be dropped. "
+                             "Mutually exclusive with random orientation_dropout_prob.")
+    parser.add_argument("--no_reconstruct_orientations", action="store_true",
+                        help="Disable orientation reconstruction (SR decoder only, for ablation studies)")
+
+    # Data interpolation
+    parser.add_argument("--upsample_mode", type=str, default="nearest",
+                        choices=["nearest", "trilinear", "nearest-exact"],
+                        help="Interpolation mode for FFT upsample recovery (default: nearest)")
+
+    # LR stack saving (for debugging/visualization)
+    parser.add_argument("--save_lr_stacks", action="store_true",
+                        help="Save LR stacks in both forms: before upsample (true LR) and after upsample")
+    parser.add_argument("--lr_stack_output_dir", type=str, default=None,
+                        help="Directory to save LR stacks (required if --save_lr_stacks is set)")
 
     # Other parameters
     parser.add_argument("--device", type=str, default="cuda", help="Device")
@@ -916,14 +1045,6 @@ if __name__ == "__main__":
     parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--final_activation", type=str, default="sigmoid",
-                       choices=["tanh", "sigmoid", "none"],
-                       help="Final activation function for decoder outputs. "
-                            "Use 'sigmoid' for [0,1] normalized inputs (default), "
-                            "'tanh' for [-1,1] normalized inputs, "
-                            "or 'none' for no activation.")
-    parser.add_argument("--max_grad_norm", type=float, default=1.0,
-                       help="Maximum gradient norm for clipping. Set to 0 to disable. Default: 1.0")
 
     args = parser.parse_args()
 
@@ -931,6 +1052,28 @@ if __name__ == "__main__":
     acquisition_types = args.acquisition_types
     if acquisition_types and len(acquisition_types) == 1 and acquisition_types[0].lower() == "all":
         acquisition_types = None
+
+    # Validate orientation dropout settings
+    if args.drop_orientations is not None and len(args.drop_orientations) > 0:
+        if args.orientation_dropout_prob > 0.0:
+            print("WARNING: Both --drop_orientations and --orientation_dropout_prob specified. "
+                  "Using deterministic dropout (--drop_orientations) and ignoring probability.")
+        if len(args.drop_orientations) >= 3:
+            raise ValueError("Cannot drop all 3 orientations. At least one must remain.")
+
+    # Validate LR stack saving settings
+    if args.save_lr_stacks and args.lr_stack_output_dir is None:
+        parser.error("--lr_stack_output_dir is required when --save_lr_stacks is set")
+
+    # Validate loss weights when orientation reconstruction is disabled
+    if args.no_reconstruct_orientations:
+        if args.orientation_weight > 0.0:
+            print("\n" + "="*80)
+            print("WARNING: Orientation reconstruction disabled but orientation_weight is non-zero")
+            print(f"  Current orientation_weight: {args.orientation_weight}")
+            print("  Orientation loss will be 0.0 regardless of this weight.")
+            print("  Recommendation: Set --orientation_weight 0.0 for cleaner metrics.")
+            print("="*80 + "\n")
 
     # Get image paths
     hr_image_paths = get_image_paths(
@@ -994,6 +1137,7 @@ if __name__ == "__main__":
         apply_intensity_aug=not args.no_intensity_aug,
         orientation_dropout_prob=args.orientation_dropout_prob,
         min_orientations=args.min_orientations,
+        drop_orientations=args.drop_orientations,
         num_workers=args.num_workers,
         use_cache=args.use_cache,
         use_wandb=args.use_wandb,
@@ -1018,5 +1162,9 @@ if __name__ == "__main__":
         val_patch_size=tuple(args.val_patch_size),
         val_overlap=args.val_overlap,
         final_activation=args.final_activation,
+        use_prior=args.use_prior,
+        use_encoder_outputs_as_skip=args.use_encoder_outputs_as_skip,
+        reconstruct_orientations=not args.no_reconstruct_orientations,
         max_grad_norm=args.max_grad_norm,
+        decoder_upsample_mode=args.decoder_upsample_mode,
     )

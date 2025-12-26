@@ -165,7 +165,13 @@ def unpad_volume(
 # =============================================================================
 
 
-def get_model_statistics(model: nn.Module, input_shapes: Optional[List[Tuple]] = None, device: str = "cuda"):
+def get_model_statistics(
+    model: nn.Module,
+    input_shapes: Optional[List[Tuple]] = None,
+    device: str = "cuda",
+    base_channels: int = 32,
+    num_scales: int = 4
+):
     """
     Calculate model parameters and memory usage.
 
@@ -174,6 +180,8 @@ def get_model_statistics(model: nn.Module, input_shapes: Optional[List[Tuple]] =
         input_shapes: Optional list of input tensor shapes for memory estimation
                      For U-HVED: [(B, C, D, H, W), (B, C, D, H, W), (B, C, D, H, W)]
         device: Device to use for memory estimation
+        base_channels: Base channel count for U-HVED architecture (default 32)
+        num_scales: Number of hierarchical scales in U-HVED (default 4)
 
     Returns:
         Dictionary with model statistics
@@ -197,9 +205,13 @@ def get_model_statistics(model: nn.Module, input_shapes: Optional[List[Tuple]] =
 
     # Estimate input data memory if shapes provided
     if input_shapes:
+        # Input data memory (always float32 due to explicit .float() conversion)
         total_input_memory = 0
         for shape in input_shapes:
-            # Assume float32 (4 bytes per element)
+            # Data is float32 (4 bytes per element)
+            # Note: Training code explicitly converts inputs to float32 via .float()
+            # even when using mixed precision (train.py lines 495-496, 608-609).
+            # Mixed precision only affects internal model computations, not input data.
             numel = 1
             for dim in shape:
                 numel *= dim
@@ -207,10 +219,129 @@ def get_model_statistics(model: nn.Module, input_shapes: Optional[List[Tuple]] =
 
         stats['input_memory_mb'] = total_input_memory / (1024 ** 2)
 
+        # Estimate activation memory (forward pass feature maps)
+        # Assumes U-HVED architecture with 3 orientations
+        # Note: This is an approximation. Actual memory may vary based on:
+        # - Gradient checkpointing (would reduce activation memory)
+        # - Mixed precision (would use 2 bytes for internal activations instead of 4)
+        # - Optimizer state (not included here - adds ~2x model memory for Adam)
+        activation_memory = estimate_uhved_activation_memory(
+            input_shapes=input_shapes,
+            base_channels=base_channels,
+            num_scales=num_scales,
+            bytes_per_element=4  # float32 activations
+        )
+        stats['activation_memory_mb'] = activation_memory / (1024 ** 2)
+
     return stats
 
 
-def print_model_statistics(model: nn.Module, input_shapes: Optional[List[Tuple]] = None, device: str = "cuda"):
+def estimate_uhved_activation_memory(
+    input_shapes: List[Tuple],
+    base_channels: int = 32,
+    num_scales: int = 4,
+    bytes_per_element: int = 4  # float32
+):
+    """
+    Estimate activation memory for U-HVED model.
+
+    U-HVED has:
+    - 3 independent encoders (one per orientation: axial, coronal, sagittal)
+    - Multi-scale latent fusion
+    - 1 decoder for SR output
+    - Optional orientation reconstruction decoders
+
+    Args:
+        input_shapes: List of input tensor shapes [(B, C, D, H, W), ...]
+        base_channels: Base channel count (default 32)
+        num_scales: Number of hierarchical scales (default 4)
+        bytes_per_element: Bytes per element (4 for float32, 2 for float16)
+
+    Returns:
+        Estimated activation memory in bytes
+    """
+    if not input_shapes or len(input_shapes) == 0:
+        return 0
+
+    # Assume all inputs have same shape (orthogonal stacks)
+    B, C, D, H, W = input_shapes[0]
+
+    total_activation_memory = 0
+
+    # 1. ENCODER ACTIVATIONS (3 encoders, one per orientation)
+    # Each encoder has num_scales levels with downsampling by 2 at each level
+    num_orientations = len(input_shapes)  # Typically 3 (axial, coronal, sagittal)
+
+    for orientation_idx in range(num_orientations):
+        spatial_dims = [D, H, W]
+
+        for scale in range(num_scales):
+            # Channel count doubles at each scale
+            channels = base_channels * (2 ** scale)
+
+            # Spatial dimensions halve at each scale (downsampling by 2)
+            current_dims = [max(1, dim // (2 ** scale)) for dim in spatial_dims]
+
+            # Conv block activations (typically 2 conv layers per block)
+            # Each conv: input + output activations
+            numel = B * channels * current_dims[0] * current_dims[1] * current_dims[2]
+            total_activation_memory += numel * 2  # 2 conv layers per block
+
+    # 2. LATENT SPACE ACTIVATIONS (Fusion of 3 encoder outputs)
+    # At the bottleneck: B x (base_channels * 2^(num_scales-1)) x (D/2^(num_scales-1)) x (H/2^(num_scales-1)) x (W/2^(num_scales-1))
+    bottleneck_channels = base_channels * (2 ** (num_scales - 1))
+    bottleneck_dims = [max(1, dim // (2 ** (num_scales - 1))) for dim in [D, H, W]]
+
+    # Fusion concatenates 3 orientation features: 3 x bottleneck_channels
+    # Then reduces back to bottleneck_channels via conv
+    fusion_numel = B * (bottleneck_channels * num_orientations) * bottleneck_dims[0] * bottleneck_dims[1] * bottleneck_dims[2]
+    total_activation_memory += fusion_numel
+
+    # Posterior (mu + logvar for VAE)
+    posterior_numel = B * bottleneck_channels * bottleneck_dims[0] * bottleneck_dims[1] * bottleneck_dims[2]
+    total_activation_memory += posterior_numel * 2  # mu and logvar
+
+    # 3. DECODER ACTIVATIONS (SR decoder, upsampling path)
+    spatial_dims = bottleneck_dims
+    for scale in range(num_scales - 1, -1, -1):
+        # Channels halve as we go up (opposite of encoder)
+        channels = base_channels * (2 ** scale)
+
+        # Spatial dimensions double at each level (upsampling by 2)
+        current_dims = [max(1, dim * (2 ** (num_scales - 1 - scale))) for dim in bottleneck_dims]
+
+        # Skip connections from encoders (concatenated from all 3 orientations)
+        skip_channels = channels * num_orientations
+
+        # Decoder block: upsampled features + skip connections + conv output
+        # Upsample: B x channels x current_dims
+        # After concat with skip: B x (channels + skip_channels) x current_dims
+        # After conv: B x channels x current_dims
+        numel_upsample = B * channels * current_dims[0] * current_dims[1] * current_dims[2]
+        numel_concat = B * (channels + skip_channels) * current_dims[0] * current_dims[1] * current_dims[2]
+        numel_conv = B * channels * current_dims[0] * current_dims[1] * current_dims[2]
+
+        total_activation_memory += numel_upsample + numel_concat + numel_conv
+
+    # 4. ORIENTATION RECONSTRUCTION DECODERS (if enabled)
+    # Typically 3 smaller decoders to reconstruct input orientations
+    # Approximate as ~30% of main decoder memory
+    orientation_decoder_memory = total_activation_memory * 0.15  # Conservative estimate
+    total_activation_memory += orientation_decoder_memory
+
+    # Convert to bytes
+    total_activation_memory_bytes = int(total_activation_memory * bytes_per_element)
+
+    return total_activation_memory_bytes
+
+
+def print_model_statistics(
+    model: nn.Module,
+    input_shapes: Optional[List[Tuple]] = None,
+    device: str = "cuda",
+    base_channels: int = 32,
+    num_scales: int = 4
+):
     """
     Print formatted model statistics.
 
@@ -218,8 +349,10 @@ def print_model_statistics(model: nn.Module, input_shapes: Optional[List[Tuple]]
         model: PyTorch model
         input_shapes: Optional list of input tensor shapes
         device: Device to use for memory estimation
+        base_channels: Base channel count for U-HVED architecture (default 32)
+        num_scales: Number of hierarchical scales in U-HVED (default 4)
     """
-    stats = get_model_statistics(model, input_shapes, device)
+    stats = get_model_statistics(model, input_shapes, device, base_channels, num_scales)
 
     print("=" * 80)
     print("MODEL STATISTICS")
@@ -227,12 +360,19 @@ def print_model_statistics(model: nn.Module, input_shapes: Optional[List[Tuple]]
     print(f"Total parameters:        {stats['total_params']:>15,}")
     print(f"Trainable parameters:    {stats['trainable_params']:>15,}")
     print(f"Non-trainable parameters:{stats['non_trainable_params']:>15,}")
-    print(f"Model memory:            {stats['model_memory_mb']:>15.2f} MB")
+    print(f"Model memory:            {stats['model_memory_mb']:>15.2f} MB (params + buffers)")
 
     if 'input_memory_mb' in stats:
-        print(f"Input data memory:       {stats['input_memory_mb']:>15.2f} MB (per batch)")
-        total_memory = stats['model_memory_mb'] + stats['input_memory_mb']
-        print(f"Total GPU memory (est):  {total_memory:>15.2f} MB")
+        print(f"Input data memory:       {stats['input_memory_mb']:>15.2f} MB (per batch, float32)")
+
+        if 'activation_memory_mb' in stats:
+            print(f"Activation memory (est): {stats['activation_memory_mb']:>15.2f} MB (forward pass)")
+            total_memory = stats['model_memory_mb'] + stats['input_memory_mb'] + stats['activation_memory_mb']
+            print(f"Total GPU memory (est):  {total_memory:>15.2f} MB")
+            print(f"  Note: Excludes gradients (~{stats['activation_memory_mb']:.2f} MB) and optimizer state (~{stats['model_memory_mb']*2:.2f} MB for Adam)")
+        else:
+            total_memory = stats['model_memory_mb'] + stats['input_memory_mb']
+            print(f"Total GPU memory (est):  {total_memory:>15.2f} MB (model + input only)")
 
     print("=" * 80)
 
@@ -684,6 +824,10 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
         # Model architecture
         'base_channels': args.base_channels,
         'num_scales': args.num_scales,
+        'final_activation': args.final_activation,
+        'use_prior': args.use_prior,
+        'use_encoder_outputs_as_skip': args.use_encoder_outputs_as_skip,
+        'decoder_upsample_mode': args.decoder_upsample_mode,
 
         # Output configuration
         'output_shape': args.output_shape,
@@ -694,10 +838,16 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
         'max_res_aniso': args.max_res_aniso,
         'randomise_res': not args.no_randomise_res,
 
-        # Loss weights
+        # Loss configuration
+        'recon_loss_type': args.recon_loss_type,
+        'recon_weight': args.recon_weight,
         'kl_weight': args.kl_weight,
         'perceptual_weight': args.perceptual_weight,
+        'ssim_weight': args.ssim_weight,
         'orientation_weight': args.orientation_weight,
+        'use_perceptual': args.use_perceptual,
+        'use_ssim': args.use_ssim,
+        'perceptual_backend': args.perceptual_backend,
 
         # Artifact probabilities
         'prob_motion': args.prob_motion,
@@ -706,14 +856,23 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
         'prob_bias_field': args.prob_bias_field,
         'prob_noise': args.prob_noise,
         'apply_intensity_aug': not args.no_intensity_aug,
+        'orientation_dropout_prob': args.orientation_dropout_prob,
+        'min_orientations': args.min_orientations,
+        'drop_orientations': args.drop_orientations,
 
         # Training optimization
         'mixed_precision': args.mixed_precision,
         'gradient_accumulation_steps': args.gradient_accumulation_steps,
+        'max_grad_norm': args.max_grad_norm,
 
         # Checkpointing
         'save_interval': args.save_interval,
         'val_interval': args.val_interval,
+
+        # Validation configuration
+        'use_sliding_window_val': args.use_sliding_window_val,
+        'val_patch_size': args.val_patch_size,
+        'val_overlap': args.val_overlap,
     }
 
     config_path = os.path.join(model_dir, 'training_config.json')
@@ -775,6 +934,287 @@ def calculate_metrics(pred: torch.Tensor, target: torch.Tensor, max_val: float =
             "r2": r2,
             "ssim": ssim,
         }
+
+
+def calculate_lpips_3d(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    backend: str = 'monai',
+    feature_layers: List[str] = None,
+    device: str = 'cuda'
+) -> float:
+    """
+    Calculate 3D-LPIPS (Learned Perceptual Image Patch Similarity) for volumetric data.
+
+    Uses proper 3D medical imaging networks instead of 2D slice-by-slice processing.
+    Leverages PerceptualLoss3D infrastructure with MedicalNet, MONAI, or Models Genesis.
+
+    Args:
+        pred: Predicted volume (B, C, D, H, W)
+        target: Target volume (B, C, D, H, W)
+        backend: 3D network backend ('medicalnet', 'monai', 'models_genesis')
+        feature_layers: Layers to extract features from
+        device: Device for computation
+
+    Returns:
+        3D-LPIPS score (lower is better, 0 = identical)
+
+    References:
+        - Zhang et al. "The Unreasonable Effectiveness of Deep Features as a Perceptual Metric"
+        - Adapted for 3D medical imaging volumes
+    """
+    try:
+        from src.losses import PerceptualLoss3D
+    except ImportError:
+        raise ImportError("PerceptualLoss3D not found in src.losses")
+
+    # Initialize 3D perceptual loss model (cached after first call)
+    cache_key = f'lpips_3d_{backend}'
+    if not hasattr(calculate_lpips_3d, cache_key):
+        if feature_layers is None:
+            feature_layers = ['layer1', 'layer2', 'layer3', 'layer4']
+
+        perceptual_loss = PerceptualLoss3D(
+            backend=backend,
+            model_depth=18,  # ResNet-18 for efficiency
+            feature_layers=feature_layers,
+            weights=[1.0] * len(feature_layers),
+            pretrained=False,  # We use random init for metric, not pre-trained
+            normalize_input=True,
+            freeze_backbone=False  # Allow gradient flow for feature extraction
+        ).to(device)
+        perceptual_loss.eval()
+        setattr(calculate_lpips_3d, cache_key, perceptual_loss)
+
+    perceptual_loss = getattr(calculate_lpips_3d, cache_key)
+
+    with torch.no_grad():
+        # Move to device
+        pred = pred.to(device)
+        target = target.to(device)
+
+        # Extract features from both volumes
+        pred_features = perceptual_loss.extract_features(pred)
+        target_features = perceptual_loss.extract_features(target)
+
+        # Compute L2 distance in feature space (LPIPS formula)
+        lpips_score = 0.0
+        num_layers = 0
+
+        for layer_name in feature_layers:
+            pred_feat = None
+            target_feat = None
+
+            # Find matching features
+            for name, feat in pred_features.items():
+                if layer_name in name:
+                    pred_feat = feat
+                    break
+
+            for name, feat in target_features.items():
+                if layer_name in name:
+                    target_feat = feat
+                    break
+
+            if pred_feat is not None and target_feat is not None:
+                # Spatial L2 normalization (LPIPS style)
+                diff = (pred_feat - target_feat) ** 2
+                # Average across spatial dimensions and channels
+                layer_dist = diff.mean(dim=[1, 2, 3, 4]).mean()
+                lpips_score += layer_dist.item()
+                num_layers += 1
+
+        # Average across layers
+        if num_layers > 0:
+            lpips_score /= num_layers
+
+    return lpips_score
+
+
+def calculate_rlpips(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    backend: str = 'monai',
+    adversarial_eps: float = 0.03,
+    device: str = 'cuda'
+) -> float:
+    """
+    Calculate R-LPIPS (Robust LPIPS) using adversarially trained features.
+
+    R-LPIPS was proposed to be robust against adversarial perturbations by using
+    features from adversarially trained networks instead of standard pre-trained ones.
+
+    Reference:
+        Ghazanfari et al. "R-LPIPS: An Adversarially Robust Perceptual Similarity Metric"
+        arXiv:2307.15157 (2023)
+        https://arxiv.org/abs/2307.15157
+
+    Args:
+        pred: Predicted volume (B, C, D, H, W)
+        target: Target volume (B, C, D, H, W)
+        backend: 3D network backend ('medicalnet', 'monai', 'models_genesis')
+        adversarial_eps: Epsilon for adversarial robustness (default: 0.03)
+        device: Device for computation
+
+    Returns:
+        R-LPIPS score (robust perceptual distance)
+
+    Note:
+        This implementation uses a simulated robust feature extractor.
+        For true R-LPIPS, networks should be adversarially trained (e.g., using PGD).
+        In medical imaging, adversarially trained 3D networks are rare, so this
+        provides an approximation using ensemble-based robustness.
+    """
+    try:
+        from src.losses import PerceptualLoss3D
+    except ImportError:
+        raise ImportError("PerceptualLoss3D not found in src.losses")
+
+    # Initialize robust perceptual loss model (cached after first call)
+    cache_key = f'rlpips_3d_{backend}'
+    if not hasattr(calculate_rlpips, cache_key):
+        feature_layers = ['layer1', 'layer2', 'layer3', 'layer4']
+
+        perceptual_loss = PerceptualLoss3D(
+            backend=backend,
+            model_depth=18,
+            feature_layers=feature_layers,
+            weights=[1.0] * len(feature_layers),
+            pretrained=False,
+            normalize_input=True,
+            freeze_backbone=False
+        ).to(device)
+        perceptual_loss.eval()
+        setattr(calculate_rlpips, cache_key, perceptual_loss)
+
+    perceptual_loss = getattr(calculate_rlpips, cache_key)
+
+    with torch.no_grad():
+        # Move to device
+        pred = pred.to(device)
+        target = target.to(device)
+
+        # R-LPIPS: Ensemble-based robustness approximation
+        # Since we don't have access to adversarially trained 3D medical networks,
+        # we use an ensemble of perturbations to simulate robustness
+        # This is inspired by the E-LPIPS (Ensemble LPIPS) approach
+
+        # Base features
+        pred_features_base = perceptual_loss.extract_features(pred)
+        target_features_base = perceptual_loss.extract_features(target)
+
+        # Add small random perturbations to simulate adversarial robustness
+        num_perturbations = 3
+        all_scores = []
+
+        for i in range(num_perturbations):
+            # Random perturbation within epsilon
+            if i == 0:
+                # Use original (no perturbation)
+                pred_pert = pred
+                target_pert = target
+            else:
+                # Add small Gaussian noise (simulating adversarial robustness)
+                noise_scale = adversarial_eps * (i / num_perturbations)
+                pred_noise = torch.randn_like(pred) * noise_scale
+                target_noise = torch.randn_like(target) * noise_scale
+
+                pred_pert = torch.clamp(pred + pred_noise, 0, 1)
+                target_pert = torch.clamp(target + target_noise, 0, 1)
+
+            # Extract features with perturbation
+            pred_features = perceptual_loss.extract_features(pred_pert)
+            target_features = perceptual_loss.extract_features(target_pert)
+
+            # Compute perceptual distance
+            score = 0.0
+            num_layers = 0
+
+            for layer_name in perceptual_loss.feature_layers:
+                pred_feat = None
+                target_feat = None
+
+                for name, feat in pred_features.items():
+                    if layer_name in name:
+                        pred_feat = feat
+                        break
+
+                for name, feat in target_features.items():
+                    if layer_name in name:
+                        target_feat = feat
+                        break
+
+                if pred_feat is not None and target_feat is not None:
+                    diff = (pred_feat - target_feat) ** 2
+                    layer_dist = diff.mean(dim=[1, 2, 3, 4]).mean()
+                    score += layer_dist.item()
+                    num_layers += 1
+
+            if num_layers > 0:
+                score /= num_layers
+
+            all_scores.append(score)
+
+        # R-LPIPS: Robust estimate using median of ensemble
+        # (median is more robust to outliers than mean)
+        rlpips_score = float(np.median(all_scores))
+
+    return rlpips_score
+
+
+def calculate_metrics_with_lpips(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    max_val: float = 1.0,
+    compute_lpips: bool = True,
+    lpips_backend: str = 'monai',
+    device: str = 'cuda'
+):
+    """
+    Calculate comprehensive evaluation metrics including 3D-LPIPS and R-LPIPS.
+
+    Args:
+        pred: Predicted volumes (B, C, D, H, W)
+        target: Target volumes (B, C, D, H, W)
+        max_val: Maximum pixel value for PSNR calculation (default: 1.0)
+        compute_lpips: Whether to compute LPIPS metrics
+        lpips_backend: 3D network backend ('monai', 'medicalnet', 'models_genesis')
+        device: Device for computation
+
+    Returns:
+        Dictionary of metrics including standard metrics, 3D-LPIPS, and R-LPIPS
+
+    References:
+        - Zhang et al. "The Unreasonable Effectiveness of Deep Features as a Perceptual Metric" (CVPR 2018)
+        - Ghazanfari et al. "R-LPIPS: An Adversarially Robust Perceptual Similarity Metric" (arXiv 2023)
+    """
+    # Get standard metrics
+    metrics = calculate_metrics(pred, target, max_val=max_val)
+
+    # Add 3D-LPIPS and R-LPIPS metrics if requested
+    if compute_lpips:
+        try:
+            with torch.no_grad():
+                # 3D-LPIPS using proper 3D encoder
+                lpips_3d = calculate_lpips_3d(
+                    pred, target, backend=lpips_backend, device=device
+                )
+                metrics['lpips_3d'] = lpips_3d
+
+                # R-LPIPS (Robust LPIPS)
+                rlpips = calculate_rlpips(
+                    pred, target, backend=lpips_backend, device=device
+                )
+                metrics['rlpips'] = rlpips
+
+        except ImportError as e:
+            import warnings
+            warnings.warn(f"3D-LPIPS calculation skipped: {str(e)}")
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Error computing 3D-LPIPS: {str(e)}")
+
+    return metrics
 
 
 # =============================================================================

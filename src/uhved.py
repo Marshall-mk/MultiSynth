@@ -57,6 +57,7 @@ class UHVED(nn.Module):
         share_encoder: bool = False,
         share_decoder: bool = False,
         use_prior: bool = True,
+        use_encoder_outputs_as_skip: bool = True,
         activation: str = 'leakyrelu',
         upsample_mode: str = 'trilinear',
         reconstruct_orientations: bool = True,
@@ -72,6 +73,7 @@ class UHVED(nn.Module):
             share_encoder: Share encoder weights across orientations
             share_decoder: Share decoder weights for orientation reconstruction
             use_prior: Include prior in Product of Gaussians
+            use_encoder_outputs_as_skip: Use encoder features as skip connections
             activation: Activation function type
             upsample_mode: Upsampling strategy in decoder
             reconstruct_orientations: Whether to reconstruct input orientations
@@ -82,6 +84,7 @@ class UHVED(nn.Module):
         self.num_orientations = num_orientations
         self.num_scales = num_scales
         self.reconstruct_orientations = reconstruct_orientations
+        self.use_encoder_outputs_as_skip = use_encoder_outputs_as_skip
 
         # Multi-modal encoder
         self.encoder = MultiModalEncoder(
@@ -178,7 +181,7 @@ class UHVED(nn.Module):
         """
         # Extract skip features from encoder
         skip_features = None
-        if encoder_outputs is not None:
+        if self.use_encoder_outputs_as_skip and encoder_outputs is not None:
             # Use features from first available orientation as skip
             skip_features = []
             for scale_data in encoder_outputs:
@@ -215,6 +218,19 @@ class UHVED(nn.Module):
                 - 'posteriors': List of (mu, logvar) at each scale
                 - 'latent_samples': Multi-scale latent samples
         """
+        # DEBUG -> Check input data from dataloader for NaN/Inf BEFORE any processing
+        if self.training:
+            for idx, orientation in enumerate(orientations):
+                if not torch.isfinite(orientation).all():
+                    print(f"=" * 80)
+                    print(f"CRITICAL: Non-finite values in INPUT DATA (orientation {idx})!")
+                    print(f"  This indicates corruption in the data pipeline (augmentations/normalization)")
+                    print(f"  Orientation {idx}: min={orientation.min().item():.4f}, max={orientation.max().item():.4f}, "
+                          f"mean={orientation.mean().item():.4f}")
+                    print(f"  has_nan={torch.isnan(orientation).any().item()}, "
+                          f"has_inf={torch.isinf(orientation).any().item()}")
+                    print(f"=" * 80)
+
         # Encode
         encoder_outputs = self.encode(orientations, orientation_mask)
 

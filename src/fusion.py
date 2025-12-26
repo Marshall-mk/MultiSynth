@@ -155,7 +155,8 @@ class GaussianSampler(nn.Module):
         self,
         mu: torch.Tensor,
         logvar: torch.Tensor,
-        deterministic: bool = False
+        deterministic: bool = False,
+        eps: float = 1e-7
     ) -> torch.Tensor:
         """
         Sample from N(mu, exp(logvar)).
@@ -164,6 +165,7 @@ class GaussianSampler(nn.Module):
             mu: Mean tensor
             logvar: Log-variance tensor
             deterministic: If True, return mean without sampling
+            eps: Small constant for numerical stability
 
         Returns:
             Sampled latent tensor
@@ -174,7 +176,7 @@ class GaussianSampler(nn.Module):
         # Reparameterization trick
         # Clamp logvar to prevent overflow: exp(0.5 * 20) is still manageable
         logvar_clamped = torch.clamp(logvar, min=-20.0, max=20.0)
-        std = torch.exp(0.5 * logvar_clamped)
+        std = torch.exp(0.5 * logvar_clamped) + eps
         noise = torch.randn_like(mu)
         return mu + std * noise
 

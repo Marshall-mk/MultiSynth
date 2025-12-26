@@ -16,7 +16,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
-from typing import Optional, List, Union, Tuple
+import os
+import json
+from pathlib import Path
+from typing import Optional, List, Union, Tuple, Dict
 
 from monai.data import Dataset, CacheDataset
 from monai.transforms import (
@@ -25,6 +28,7 @@ from monai.transforms import (
     ToTensord, ScaleIntensityRangePercentiles,
     CenterSpatialCropd, Resize, RandAffined,
 )
+import nibabel as nib
 
 
 
@@ -622,6 +626,7 @@ class MRIArtifactSimulator(torch.nn.Module):
         noise_std: float = 0.05,
         motion_intensity: float = 1.5,
         spike_intensity: float = 0.04,
+        upsample_mode: str = "nearest",
     ):
         super().__init__()
         self.volume_res = torch.tensor(volume_res, dtype=torch.float32)
@@ -634,6 +639,7 @@ class MRIArtifactSimulator(torch.nn.Module):
         self.noise_std = noise_std
         self.motion_intensity = motion_intensity
         self.spike_intensity = spike_intensity
+        self.upsample_mode = upsample_mode
         self.physics_engine = SliceProfilePhysics(profile_type='trapezoid', edge_width=0.1)
 
     def forward(
@@ -647,6 +653,7 @@ class MRIArtifactSimulator(torch.nn.Module):
         enable_noise: Optional[torch.Tensor] = None,
         motion_axis: Optional[torch.Tensor] = None,
         aliasing_axis: Optional[torch.Tensor] = None,
+        return_intermediate: bool = False,
     ) -> torch.Tensor:
         """
         Apply MRI artifact simulation.
@@ -661,13 +668,15 @@ class MRIArtifactSimulator(torch.nn.Module):
             enable_noise: Pre-sampled bool mask (B,) for noise
             motion_axis: Pre-sampled axis (B,) for motion direction
             aliasing_axis: Pre-sampled axis (B,) for aliasing direction
+            return_intermediate: If True, return both upsampled and true LR outputs
 
         Returns:
-            Simulated LR volume (B, C, D, H, W)
+            Simulated LR volume (B, C, D, H, W), or tuple of (upsampled, true_lr) if return_intermediate=True
         """
         batch_size = image.shape[0]
         device = image.device
         outputs = []
+        true_lr_outputs = [] if return_intermediate else None
 
         for b in range(batch_size):
             img = image[b]  # (C, D, H, W)
@@ -727,6 +736,7 @@ class MRIArtifactSimulator(torch.nn.Module):
             downsample_axis = torch.argmax(factors).item()
             factor = factors[downsample_axis].item()
 
+            true_lr_img = None
             if factor > 1.1:
                 # Downsample via FFT cropping (simulates acquisition matrix limit)
                 original_shape = img.shape
@@ -750,13 +760,25 @@ class MRIArtifactSimulator(torch.nn.Module):
                 cropped_fft = torch.fft.ifftshift(cropped_fft, dim=(1, 2, 3))
                 img = torch.real(torch.fft.ifftn(cropped_fft, dim=(1, 2, 3)))
 
-                # Upsample back (Nearest Neighbor)
+                # Capture true LR if requested (before upsample)
+                if return_intermediate:
+                    true_lr_img = img.clone()
+
+                # Upsample back to output_shape
                 if list(img.shape[1:]) != self.output_shape:
                     img = torch.nn.functional.interpolate(
                         img.unsqueeze(0),
                         size=self.output_shape,
-                        mode="nearest",
+                        mode=self.upsample_mode,
                     ).squeeze(0)
+
+            # Store true LR output if capturing intermediates
+            if return_intermediate:
+                if true_lr_img is not None:
+                    true_lr_outputs.append(true_lr_img.unsqueeze(0))
+                else:
+                    # No downsampling occurred, use current img
+                    true_lr_outputs.append(img.clone().unsqueeze(0))
 
             # --- STEP 5: Noise ---
             if enable_noise is not None:
@@ -771,7 +793,13 @@ class MRIArtifactSimulator(torch.nn.Module):
 
             outputs.append(img.unsqueeze(0))
 
-        return torch.cat(outputs, dim=0)
+        final_output = torch.cat(outputs, dim=0)
+
+        if return_intermediate:
+            true_lr_output = torch.cat(true_lr_outputs, dim=0)
+            return final_output, true_lr_output
+        else:
+            return final_output
 
 
 class HRLRDataGenerator:
@@ -795,6 +823,9 @@ class HRLRDataGenerator:
                                  missing views during inference. Default: 0.0 (no dropout)
         min_orientations: Minimum number of orientations to keep after dropout (1-3).
                          Default: 1 (allows training with single views)
+        drop_orientations: Specific orientations to drop (0=Axial, 1=Coronal, 2=Sagittal).
+                          If specified, these orientations will ALWAYS be dropped (deterministic).
+                          Mutually exclusive with random orientation_dropout_prob. Default: None
     """
 
     def __init__(
@@ -815,9 +846,15 @@ class HRLRDataGenerator:
         # Toggles
         apply_intensity_aug: bool = True,
         clip_to_unit_range: bool = True,
-        # Orientation dropout (for robust training with missing views)
+        # Orientation dropout 
         orientation_dropout_prob: float = 0.0,
         min_orientations: int = 1,
+        drop_orientations: list = None,
+        # Interpolation mode
+        upsample_mode: str = "nearest",
+        # LR stack saving
+        save_lr_stacks: bool = False,
+        lr_stack_output_dir: Optional[str] = None,
     ):
         self.atlas_res = atlas_res
         self.target_res = target_res
@@ -827,10 +864,30 @@ class HRLRDataGenerator:
         self.clip_to_unit_range = clip_to_unit_range
 
         self.prob_bias_field = prob_bias_field
+        self.upsample_mode = upsample_mode
+
+        # LR stack saving parameters
+        self.save_lr_stacks = save_lr_stacks
+        self.lr_stack_output_dir = lr_stack_output_dir
+
+        if save_lr_stacks:
+            if lr_stack_output_dir is None:
+                raise ValueError("lr_stack_output_dir required when save_lr_stacks=True")
+            os.makedirs(lr_stack_output_dir, exist_ok=True)
+            print(f"Warning: LR stack saving enabled. Output directory: {lr_stack_output_dir}")
+            print(f"  → This will slow down training and use significant disk space.")
 
         # Orientation dropout parameters
         self.orientation_dropout_prob = orientation_dropout_prob
         self.min_orientations = max(1, min(min_orientations, 3))  # Clamp to [1, 3]
+        self.drop_orientations = drop_orientations
+
+        # Validate drop_orientations if specified
+        if self.drop_orientations is not None:
+            if len(self.drop_orientations) >= 3:
+                raise ValueError("Cannot drop all orientations. Must keep at least one.")
+            if any(idx not in [0, 1, 2] for idx in self.drop_orientations):
+                raise ValueError("drop_orientations must contain indices 0, 1, or 2")
 
         # 1. Resolution Sampler
         if randomise_res:
@@ -868,7 +925,8 @@ class HRLRDataGenerator:
             prob_aliasing=prob_aliasing,
             prob_noise=prob_noise,
             noise_std=0.02,
-            motion_intensity=0.5
+            motion_intensity=0.5,
+            upsample_mode=upsample_mode,
         )
 
         # Normalization helper
@@ -885,18 +943,28 @@ class HRLRDataGenerator:
         """
         Create orientation mask for dropout (simulating missing views).
 
+        Two modes:
+        1. Deterministic: If drop_orientations is specified, always drop those indices
+        2. Random: If orientation_dropout_prob > 0, randomly drop orientations
+
         Args:
             batch_size: Number of volumes in batch
             device: Device to create tensors on
 
         Returns:
             Boolean mask of shape (batch_size, 3) where True indicates orientation is present.
-            Always ensures at least min_orientations are present per sample.
+            Always ensures at least one orientation is present per sample.
         """
         # Start with all orientations present
         mask = torch.ones(batch_size, 3, dtype=torch.bool, device=device)
 
-        # Apply dropout with probability
+        # Mode 1: Deterministic dropout (takes precedence)
+        if self.drop_orientations is not None and len(self.drop_orientations) > 0:
+            for idx in self.drop_orientations:
+                mask[:, idx] = False
+            return mask
+
+        # Mode 2: Random dropout (existing behavior)
         if self.orientation_dropout_prob > 0.0:
             for b in range(batch_size):
                 # Decide whether to apply dropout for this sample
@@ -1024,6 +1092,7 @@ class HRLRDataGenerator:
         self,
         hr_images: torch.Tensor,
         return_resolution: bool = False,
+        sample_info: Optional[Dict] = None,
     ):
         """
         Generate paired LR-HR training data with three orthogonal LR stacks.
@@ -1103,17 +1172,32 @@ class HRLRDataGenerator:
             # Pass pre-sampled decisions to ensure consistency
             resolution = resolutions[stack_idx]
             thickness = thicknesses[stack_idx]
-            lr_images = self.artifact_simulator(
-                lr_images,
-                resolution,
-                thickness,
-                enable_motion=apply_motion,
-                enable_spike=apply_spike,
-                enable_aliasing=apply_aliasing,
-                enable_noise=apply_noise,
-                motion_axis=motion_axis,
-                aliasing_axis=aliasing_axis,
-            )
+
+            if self.save_lr_stacks:
+                lr_images, true_lr_images = self.artifact_simulator(
+                    lr_images,
+                    resolution,
+                    thickness,
+                    enable_motion=apply_motion,
+                    enable_spike=apply_spike,
+                    enable_aliasing=apply_aliasing,
+                    enable_noise=apply_noise,
+                    motion_axis=motion_axis,
+                    aliasing_axis=aliasing_axis,
+                    return_intermediate=True,
+                )
+            else:
+                lr_images = self.artifact_simulator(
+                    lr_images,
+                    resolution,
+                    thickness,
+                    enable_motion=apply_motion,
+                    enable_spike=apply_spike,
+                    enable_aliasing=apply_aliasing,
+                    enable_noise=apply_noise,
+                    motion_axis=motion_axis,
+                    aliasing_axis=aliasing_axis,
+                )
 
             # === STEP 5: REALISTIC LR INTENSITY NORMALIZATION ===
             if self.clip_to_unit_range:
@@ -1139,6 +1223,18 @@ class HRLRDataGenerator:
                 lr_images = torch.cat(lr_norm, dim=0)
                 lr_stacks.append(lr_images)
 
+                # Save LR stacks if enabled
+                if self.save_lr_stacks and self.lr_stack_output_dir is not None:
+                    self._save_lr_stack_pair(
+                        stack_idx=stack_idx,
+                        true_lr=true_lr_images,
+                        upsampled_lr=lr_images,
+                        resolution=resolution,
+                        thickness=thickness,
+                        sample_info=sample_info,
+                        batch_size=batch_size,
+                    )
+
         # HR is already normalized by percentiles; clip tiny float drift
         hr_augmented = torch.clamp(hr_augmented, 0.0, 1.0)
 
@@ -1153,6 +1249,89 @@ class HRLRDataGenerator:
             return lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask
         else:
             return lr_stacks, hr_augmented, orientation_mask
+
+    def _save_lr_stack_pair(
+        self,
+        stack_idx: int,
+        true_lr: torch.Tensor,
+        upsampled_lr: torch.Tensor,
+        resolution: torch.Tensor,
+        thickness: torch.Tensor,
+        sample_info: Optional[Dict],
+        batch_size: int,
+    ):
+        """Save both versions of LR stack (before and after upsample)."""
+        stack_names = ['axial', 'coronal', 'sagittal']
+        stack_name = stack_names[stack_idx]
+
+        for b in range(batch_size):
+            # Get sample identifier
+            if sample_info and 'volume_name' in sample_info:
+                sample_id = sample_info['volume_name'][b]
+            else:
+                sample_id = f"sample_{b}"
+
+            # Create output directory for this sample
+            sample_dir = os.path.join(self.lr_stack_output_dir, sample_id)
+            os.makedirs(sample_dir, exist_ok=True)
+
+            # Extract resolution and thickness for this sample
+            res = resolution[b].cpu().numpy()  # (3,)
+            thick = thickness[b].cpu().numpy()  # (3,)
+
+            # Save true LR (before upsample)
+            true_lr_vol = true_lr[b, 0].cpu().numpy()  # Remove batch and channel dims
+            true_lr_affine = self._compute_affine_from_resolution(
+                true_lr_vol.shape, res
+            )
+            true_lr_path = os.path.join(
+                sample_dir, f"stack_{stack_idx}_{stack_name}_true_lr.nii.gz"
+            )
+            nib.save(nib.Nifti1Image(true_lr_vol, true_lr_affine), true_lr_path)
+
+            # Save upsampled LR (after upsample to output_shape)
+            upsampled_vol = upsampled_lr[b, 0].cpu().numpy()
+            upsampled_affine = self._compute_affine_from_resolution(
+                upsampled_vol.shape, self.atlas_res
+            )
+            upsampled_path = os.path.join(
+                sample_dir, f"stack_{stack_idx}_{stack_name}_upsampled.nii.gz"
+            )
+            nib.save(nib.Nifti1Image(upsampled_vol, upsampled_affine), upsampled_path)
+
+            # Save metadata JSON
+            metadata_path = os.path.join(
+                sample_dir, f"stack_{stack_idx}_{stack_name}_metadata.json"
+            )
+            metadata = {
+                'stack_idx': stack_idx,
+                'stack_name': stack_name,
+                'resolution_mm': res.tolist(),
+                'thickness_mm': thick.tolist(),
+                'true_lr_shape': list(true_lr_vol.shape),
+                'upsampled_shape': list(upsampled_vol.shape),
+                'output_shape': self.output_shape,
+                'atlas_res': self.atlas_res,
+            }
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+
+    def _compute_affine_from_resolution(self, shape, resolution):
+        """Compute NIfTI affine matrix from shape and voxel resolution."""
+        import numpy as np
+        affine = np.eye(4)
+        # Set voxel sizes on diagonal
+        if isinstance(resolution, (list, tuple, np.ndarray)):
+            affine[0, 0] = resolution[0]
+            affine[1, 1] = resolution[1]
+            affine[2, 2] = resolution[2]
+        else:
+            affine[0, 0] = resolution
+            affine[1, 1] = resolution
+            affine[2, 2] = resolution
+        # Center the volume
+        affine[:3, 3] = -np.array(shape) * np.diag(affine[:3, :3]) / 2
+        return affine
 
 
 # --- Dataset Wrappers ---
@@ -1178,6 +1357,13 @@ class GeneratorDataset(torch.utils.data.Dataset):
         data = self.base_dataset[idx]
         hr_image = data["image"]
 
+        # Extract volume name from metadata for saving
+        sample_info = None
+        if hasattr(self.base_dataset, 'data') and idx < len(self.base_dataset.data):
+            volume_path = self.base_dataset.data[idx].get("image", "")
+            volume_name = Path(volume_path).stem if volume_path else f"sample_{idx}"
+            sample_info = {'volume_name': [volume_name]}  # List for batch consistency
+
         if hr_image.ndim == 3:
             hr_image = hr_image.unsqueeze(0)
         hr_image = hr_image.unsqueeze(0)  # (1, C, D, H, W)
@@ -1185,6 +1371,7 @@ class GeneratorDataset(torch.utils.data.Dataset):
         result = self.generator.generate_paired_data(
             hr_image,
             return_resolution=self.return_resolution,
+            sample_info=sample_info,
         )
 
         if self.return_resolution:
@@ -1262,3 +1449,257 @@ def create_dataset(
         dataset = Dataset(data=data_dicts, transform=transform)
 
     return GeneratorDataset(dataset, generator, return_resolution)
+
+
+if __name__ == "__main__":
+    import argparse
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    import matplotlib.pyplot as plt
+
+    parser = argparse.ArgumentParser(description="Test data generation pipeline")
+
+    # Input/Output
+    parser.add_argument("--input", type=str, required=True,
+                        help="Path to input HR NIfTI volume")
+    parser.add_argument("--output_dir", type=str, default="./data_debug",
+                        help="Output directory for generated data")
+    parser.add_argument("--num_samples", type=int, default=1,
+                        help="Number of samples to generate from the same volume")
+
+    # Resolution parameters
+    parser.add_argument("--atlas_res", type=float, nargs=3, default=[1.0, 1.0, 1.0],
+                        help="Atlas (HR) resolution in mm")
+    parser.add_argument("--output_shape", type=int, nargs=3, default=[128, 128, 128],
+                        help="Output volume shape")
+    parser.add_argument("--min_resolution", type=float, nargs=3, default=[1.0, 1.0, 1.0],
+                        help="Minimum resolution")
+    parser.add_argument("--max_res_aniso", type=float, nargs=3, default=[9.0, 9.0, 9.0],
+                        help="Maximum anisotropic resolution")
+    parser.add_argument("--no_randomise_res", action="store_true",
+                        help="Disable resolution randomization")
+
+    # Artifact probabilities
+    parser.add_argument("--prob_motion", type=float, default=0.2,
+                        help="Probability of motion artifacts")
+    parser.add_argument("--prob_spike", type=float, default=0.05,
+                        help="Probability of k-space spikes")
+    parser.add_argument("--prob_aliasing", type=float, default=0.1,
+                        help="Probability of aliasing")
+    parser.add_argument("--prob_bias_field", type=float, default=0.5,
+                        help="Probability of bias field")
+    parser.add_argument("--prob_noise", type=float, default=0.8,
+                        help="Probability of noise")
+
+    # Augmentation
+    parser.add_argument("--no_intensity_aug", action="store_true",
+                        help="Disable intensity augmentation")
+    parser.add_argument("--upsample_mode", type=str, default="nearest",
+                        choices=["nearest", "trilinear", "nearest-exact"],
+                        help="Interpolation mode for FFT upsample recovery")
+
+    # Orientation dropout
+    parser.add_argument("--orientation_dropout_prob", type=float, default=0.0,
+                        help="Probability of dropping orientations")
+
+    # Saving options
+    parser.add_argument("--save_nifti", action="store_true",
+                        help="Save NIfTI volumes")
+    parser.add_argument("--save_visualizations", action="store_true",
+                        help="Save comparison visualizations")
+    parser.add_argument("--save_metadata", action="store_true",
+                        help="Save JSON metadata")
+
+    args = parser.parse_args()
+
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("="*80)
+    print("Data Generation Pipeline - Standalone Mode")
+    print("="*80)
+    print(f"Input: {args.input}")
+    print(f"Output: {output_dir}")
+    print(f"Samples: {args.num_samples}")
+    print("="*80)
+
+    # Load HR volume
+    print("\n[1/4] Loading HR volume...")
+    transforms = Compose([
+        LoadImaged(keys=["image"], image_only=True),
+        EnsureChannelFirstd(keys=["image"]),
+        Orientationd(keys=["image"], axcodes="RAS", labels=None),
+        Spacingd(keys=["image"], pixdim=args.atlas_res, mode="bilinear"),
+        ScaleIntensityRangePercentiles(keys=["image"], lower=0.5, upper=99.5,
+                                        b_min=0.0, b_max=1.0, clip=True),
+    ])
+
+    data_dict = {"image": args.input}
+    transformed = transforms(data_dict)
+    hr_volume = transformed["image"]
+
+    # Ensure correct shape
+    if hr_volume.ndim == 3:
+        hr_volume = hr_volume.unsqueeze(0)  # Add channel dim
+    hr_volume = hr_volume.unsqueeze(0)  # Add batch dim (1, C, D, H, W)
+
+    print(f"  ✓ Loaded: {hr_volume.shape}")
+    print(f"  ✓ Value range: [{hr_volume.min():.4f}, {hr_volume.max():.4f}]")
+
+    # Create data generator
+    print("\n[2/4] Initializing data generator...")
+    generator = HRLRDataGenerator(
+        atlas_res=args.atlas_res,
+        target_res=[1.0, 1.0, 1.0],
+        output_shape=args.output_shape,
+        min_resolution=args.min_resolution,
+        max_res_aniso=args.max_res_aniso,
+        randomise_res=not args.no_randomise_res,
+        prob_motion=args.prob_motion,
+        prob_spike=args.prob_spike,
+        prob_aliasing=args.prob_aliasing,
+        prob_bias_field=args.prob_bias_field,
+        prob_noise=args.prob_noise,
+        apply_intensity_aug=not args.no_intensity_aug,
+        clip_to_unit_range=True,
+        orientation_dropout_prob=args.orientation_dropout_prob,
+        upsample_mode=args.upsample_mode,
+    )
+    print("  ✓ Generator initialized")
+
+    # Generate samples
+    print(f"\n[3/4] Generating {args.num_samples} sample(s)...")
+    for sample_idx in range(args.num_samples):
+        print(f"\n  Sample {sample_idx + 1}/{args.num_samples}:")
+
+        # Generate LR/HR pairs
+        lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask = \
+            generator.generate_paired_data(hr_volume, return_resolution=True)
+
+        print(f"    ✓ Generated 3 LR stacks")
+        print(f"    ✓ HR shape: {hr_augmented.shape}")
+        print(f"    ✓ Orientation mask: {orientation_mask.squeeze().cpu().numpy()}")
+
+        # Print resolution info
+        for i, (res, thick) in enumerate(zip(resolutions, thicknesses)):
+            res_np = res.squeeze().cpu().numpy()
+            thick_np = thick.squeeze().cpu().numpy()
+            stack_names = ['Axial', 'Coronal', 'Sagittal']
+            print(f"    ✓ {stack_names[i]}: res={res_np}, thick={thick_np}")
+
+        # Save outputs
+        sample_dir = output_dir / f"sample_{sample_idx:03d}"
+        sample_dir.mkdir(exist_ok=True)
+
+        # Save NIfTI files
+        if args.save_nifti:
+            print(f"\n    Saving NIfTI files to {sample_dir}/...")
+
+            # Save HR
+            hr_vol = hr_augmented.squeeze(0).squeeze(0).cpu().numpy()
+            hr_affine = np.eye(4)
+            hr_affine[0, 0] = args.atlas_res[0]
+            hr_affine[1, 1] = args.atlas_res[1]
+            hr_affine[2, 2] = args.atlas_res[2]
+            hr_affine[:3, 3] = -np.array(hr_vol.shape) * np.diag(hr_affine[:3, :3]) / 2
+            nib.save(nib.Nifti1Image(hr_vol, hr_affine),
+                     sample_dir / "hr_augmented.nii.gz")
+
+            # Save LR stacks
+            stack_names = ['axial', 'coronal', 'sagittal']
+            for i, (lr_stack, res) in enumerate(zip(lr_stacks, resolutions)):
+                lr_vol = lr_stack.squeeze(0).squeeze(0).cpu().numpy()
+                res_np = res.squeeze().cpu().numpy()
+
+                lr_affine = np.eye(4)
+                lr_affine[0, 0] = res_np[0]
+                lr_affine[1, 1] = res_np[1]
+                lr_affine[2, 2] = res_np[2]
+                lr_affine[:3, 3] = -np.array(lr_vol.shape) * np.diag(lr_affine[:3, :3]) / 2
+
+                nib.save(nib.Nifti1Image(lr_vol, lr_affine),
+                         sample_dir / f"lr_{stack_names[i]}.nii.gz")
+
+            print(f"      ✓ Saved 4 NIfTI files")
+
+        # Save visualizations
+        if args.save_visualizations:
+            print(f"\n    Creating visualization...")
+
+            fig, axes = plt.subplots(3, 4, figsize=(16, 12))
+            stack_names = ['Axial', 'Coronal', 'Sagittal']
+
+            # Get middle slices
+            hr_vol = hr_augmented.squeeze(0).squeeze(0).cpu().numpy()
+            mid_slices = [s // 2 for s in hr_vol.shape]
+
+            for row, axis_idx in enumerate([2, 1, 0]):  # Axial, Coronal, Sagittal
+                # HR slice
+                if axis_idx == 0:
+                    hr_slice = hr_vol[mid_slices[0], :, :]
+                elif axis_idx == 1:
+                    hr_slice = hr_vol[:, mid_slices[1], :]
+                else:
+                    hr_slice = hr_vol[:, :, mid_slices[2]]
+
+                axes[row, 0].imshow(hr_slice.T, cmap='gray', origin='lower')
+                axes[row, 0].set_title(f'HR - {stack_names[row]} View')
+                axes[row, 0].axis('off')
+
+                # LR stacks
+                for col, lr_stack in enumerate(lr_stacks):
+                    lr_vol = lr_stack.squeeze(0).squeeze(0).cpu().numpy()
+                    mid_lr = [s // 2 for s in lr_vol.shape]
+
+                    if axis_idx == 0:
+                        lr_slice = lr_vol[mid_lr[0], :, :]
+                    elif axis_idx == 1:
+                        lr_slice = lr_vol[:, mid_lr[1], :]
+                    else:
+                        lr_slice = lr_vol[:, :, mid_lr[2]]
+
+                    axes[row, col + 1].imshow(lr_slice.T, cmap='gray', origin='lower')
+                    axes[row, col + 1].set_title(f'LR Stack {col} - {stack_names[row]} View')
+                    axes[row, col + 1].axis('off')
+
+            plt.tight_layout()
+            plt.savefig(sample_dir / "comparison.png", dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"      ✓ Saved comparison.png")
+
+        # Save metadata
+        if args.save_metadata:
+            metadata = {
+                'input_file': str(args.input),
+                'sample_idx': sample_idx,
+                'hr_shape': list(hr_augmented.shape),
+                'lr_shapes': [list(s.shape) for s in lr_stacks],
+                'resolutions': [res.squeeze().cpu().numpy().tolist() for res in resolutions],
+                'thicknesses': [thick.squeeze().cpu().numpy().tolist() for thick in thicknesses],
+                'orientation_mask': orientation_mask.squeeze().cpu().numpy().tolist(),
+                'parameters': {
+                    'atlas_res': args.atlas_res,
+                    'output_shape': args.output_shape,
+                    'min_resolution': args.min_resolution,
+                    'max_res_aniso': args.max_res_aniso,
+                    'randomise_res': not args.no_randomise_res,
+                    'prob_motion': args.prob_motion,
+                    'prob_spike': args.prob_spike,
+                    'prob_aliasing': args.prob_aliasing,
+                    'prob_bias_field': args.prob_bias_field,
+                    'prob_noise': args.prob_noise,
+                    'apply_intensity_aug': not args.no_intensity_aug,
+                    'upsample_mode': args.upsample_mode,
+                    'orientation_dropout_prob': args.orientation_dropout_prob,
+                }
+            }
+
+            with open(sample_dir / "metadata.json", 'w') as f:
+                json.dump(metadata, f, indent=2)
+            print(f"      ✓ Saved metadata.json")
+
+    print("\n" + "="*80)
+    print("✓ Data generation complete!")
+    print(f"✓ Output saved to: {output_dir}")
+    print("="*80)

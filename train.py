@@ -535,24 +535,6 @@ def train_uhved_model(
 
             epoch_loss += loss.item()
 
-            # DEBUG -> Early NaN detection
-            if not torch.isfinite(loss):
-                accelerator.print(f"\n{'='*80}")
-                accelerator.print(f"CRITICAL: NaN/Inf detected in loss at epoch {epoch+1}, batch {batch_idx}")
-                accelerator.print(f"Loss value: {loss.item()}")
-                accelerator.print(f"Learning rate: {optimizer.param_groups[0]['lr']:.2e}")
-
-                # Print gradient statistics
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-                accelerator.print(f"Gradient norm: {total_norm:.4f}")
-
-                accelerator.print(f"{'='*80}\n")
-
             epoch_recon_loss += losses['reconstruction'].item()
             epoch_kl_loss += losses['kl'].item()
             epoch_ssim_loss += losses['ssim'].item() if 'ssim' in losses else 0.0
@@ -571,18 +553,8 @@ def train_uhved_model(
                 "lr": f"{current_lr:.2e}"
             }
 
-            # DEBUG -> Add GPU memory to progress bar (update every 10 batches to avoid overhead)
-            if batch_idx % 10 == 0:
-                mem_stats = get_gpu_memory_stats(accelerator.device)
-                if mem_stats:
-                    postfix_dict["mem"] = f"{mem_stats['allocated_mb']:.0f}MB"
-
             pbar.set_postfix(postfix_dict)
 
-            # DEBUG -> Print actual GPU memory usage after first batch (once per training run)
-            if epoch == start_epoch and batch_idx == 0 and accelerator.is_main_process:
-                print()  # New line after progress bar
-                print_gpu_memory_stats(accelerator.device, prefix="After first batch")
 
         avg_loss = epoch_loss / len(dataloader)
         avg_recon = epoch_recon_loss / len(dataloader)
@@ -749,20 +721,6 @@ def train_uhved_model(
                     "val/ssim": val_metrics['ssim'],
                 })
             wandb.log(wandb_log_data)
-
-        # DEBUG -> Monitor weight norms every 10 epochs to detect potential instability early
-        if accelerator.is_main_process and (epoch + 1) % 10 == 0:
-            max_weight_norm = 0.0
-            max_weight_layer = ""
-            for name, param in accelerator.unwrap_model(model).named_parameters():
-                if param.requires_grad and 'weight' in name:
-                    param_norm = param.data.norm(2).item()
-                    if param_norm > max_weight_norm:
-                        max_weight_norm = param_norm
-                        max_weight_layer = name
-            accelerator.print(f"  Weight monitoring - Max norm: {max_weight_norm:.2f} in layer: {max_weight_layer}")
-            if max_weight_norm > 100.0:
-                accelerator.print(f"  ⚠️  WARNING: Large weight norm detected! Consider early stopping or reducing learning rate.")
 
         # Save best model if validation loss improved
         if val_loss is not None and val_loss < best_val_loss:

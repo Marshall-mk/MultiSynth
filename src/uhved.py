@@ -218,19 +218,6 @@ class UHVED(nn.Module):
                 - 'posteriors': List of (mu, logvar) at each scale
                 - 'latent_samples': Multi-scale latent samples
         """
-        # DEBUG -> Check input data from dataloader for NaN/Inf BEFORE any processing
-        if self.training:
-            for idx, orientation in enumerate(orientations):
-                if not torch.isfinite(orientation).all():
-                    print(f"=" * 80)
-                    print(f"CRITICAL: Non-finite values in INPUT DATA (orientation {idx})!")
-                    print(f"  This indicates corruption in the data pipeline (augmentations/normalization)")
-                    print(f"  Orientation {idx}: min={orientation.min().item():.4f}, max={orientation.max().item():.4f}, "
-                          f"mean={orientation.mean().item():.4f}")
-                    print(f"  has_nan={torch.isnan(orientation).any().item()}, "
-                          f"has_inf={torch.isinf(orientation).any().item()}")
-                    print(f"=" * 80)
-
         # Encode
         encoder_outputs = self.encode(orientations, orientation_mask)
 

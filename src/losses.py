@@ -734,25 +734,6 @@ class UHVEDLoss(nn.Module):
             mod_loss = torch.tensor(0.0, device=sr_output.device)
             for idx, (mod_out, mod_target) in enumerate(zip(orientation_outputs, orientation_targets)):
                 if mod_target is not None:
-                    # DEBUG -> Check for NaN in orientation outputs and targets
-                    if not torch.isfinite(mod_out).all():
-                        print(f"\n{'='*80}")
-                        print(f"WARNING: NaN/Inf in orientation_outputs[{idx}] (reconstructed orientation)")
-                        print(f"  This indicates the decoder's orientation reconstruction branch is producing NaN")
-                        print(f"  Orientation {idx}: min={mod_out.min().item():.4f}, max={mod_out.max().item():.4f}, "
-                              f"mean={mod_out.mean().item():.4f}")
-                        print(f"  has_nan={torch.isnan(mod_out).any().item()}, has_inf={torch.isinf(mod_out).any().item()}")
-                        print(f"{'='*80}\n")
-
-                    if not torch.isfinite(mod_target).all():
-                        print(f"\n{'='*80}")
-                        print(f"WARNING: NaN/Inf in orientation_targets[{idx}] (input LR stack)")
-                        print(f"  This indicates the dataloader is providing corrupted LR stacks")
-                        print(f"  Orientation {idx}: min={mod_target.min().item():.4f}, max={mod_target.max().item():.4f}, "
-                              f"mean={mod_target.mean().item():.4f}")
-                        print(f"  has_nan={torch.isnan(mod_target).any().item()}, has_inf={torch.isinf(mod_target).any().item()}")
-                        print(f"{'='*80}\n")
-
                     mod_loss = mod_loss + self.recon_loss(mod_out, mod_target)
             losses['orientation'] = mod_loss * self.orientation_weight
         else:
@@ -760,31 +741,6 @@ class UHVEDLoss(nn.Module):
 
         # Total loss
         total_loss = sum(losses.values())
-
-        # DEBUG -> NaN/Inf detection and debugging
-        if not torch.isfinite(total_loss):
-            print("\n" + "="*80)
-            print("WARNING: NaN or Inf detected in loss!")
-            print("="*80)
-            for loss_name, loss_value in losses.items():
-                finite = torch.isfinite(loss_value).item() if torch.is_tensor(loss_value) else True
-                print(f"{loss_name}: {loss_value.item() if torch.is_tensor(loss_value) else loss_value} "
-                      f"(finite: {finite})")
-
-            # Check inputs
-            print(f"\nInput statistics:")
-            print(f"  sr_output: min={sr_output.min().item():.4f}, max={sr_output.max().item():.4f}, "
-                  f"mean={sr_output.mean().item():.4f}, has_nan={torch.isnan(sr_output).any().item()}")
-            print(f"  sr_target: min={sr_target.min().item():.4f}, max={sr_target.max().item():.4f}, "
-                  f"mean={sr_target.mean().item():.4f}, has_nan={torch.isnan(sr_target).any().item()}")
-
-            # Check posteriors
-            if posteriors:
-                print(f"\nPosterior statistics:")
-                for i, (mu, logvar) in enumerate(posteriors):
-                    print(f"  Scale {i}: mu range=[{mu.min().item():.4f}, {mu.max().item():.4f}], "
-                          f"logvar range=[{logvar.min().item():.4f}, {logvar.max().item():.4f}]")
-            print("="*80 + "\n")
 
         # Update step counter
         if self.training:

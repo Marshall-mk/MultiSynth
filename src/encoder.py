@@ -99,21 +99,8 @@ class EncoderBlock(nn.Module):
             mu: Mean of variational distribution
             logvar: Log-variance of variational distribution (clamped)
         """
-        # DEBUG -> Check input to encoder block for NaN/Inf
-        if self.training and (not torch.isfinite(x).all()):
-            print(f"WARNING: Non-finite values in INPUT to EncoderBlock!")
-            print(f"  Input: min={x.min().item():.4f}, max={x.max().item():.4f}, "
-                  f"mean={x.mean().item():.4f}, has_nan={torch.isnan(x).any().item()}, "
-                  f"has_inf={torch.isinf(x).any().item()}")
 
         features = self.blocks(x)
-
-        # DEBUG -> Early detection: Check for NaN/Inf in features before projection
-        if self.training and (not torch.isfinite(features).all()):
-            print(f"WARNING: Non-finite values detected in encoder features!")
-            print(f"  Features: min={features.min().item():.4f}, max={features.max().item():.4f}, "
-                  f"mean={features.mean().item():.4f}, has_nan={torch.isnan(features).any().item()}")
-
         variational_params = self.variational_proj(features)
 
         # Split into mu and logvar

@@ -16,3 +16,4 @@ einops
 scipy
 matplotlib
 streamlit
+rich

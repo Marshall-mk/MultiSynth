@@ -754,7 +754,7 @@ def find_latest_checkpoint(model_dir, model_type="uhved"):
     def get_epoch(path):
         try:
             return int(path.split('epoch_')[-1].split('.pth')[0])
-        except:
+        except (ValueError, IndexError):
             return -1
 
     checkpoints.sort(key=get_epoch)

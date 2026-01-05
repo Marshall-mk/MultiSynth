@@ -101,6 +101,7 @@ def train_uhved_model(
     final_activation: str = "sigmoid",
     max_grad_norm: float = 1.0,
     decoder_upsample_mode: str = "trilinear",
+    upsample_mode: str = "nearest",
 ):
     """
     Train U-HVED model with orthogonal LR stacks
@@ -130,6 +131,7 @@ def train_uhved_model(
         orientation_dropout_prob: Probability of applying orientation dropout (0.0-1.0)
         min_orientations: Minimum number of orientations to keep after dropout (1-3)
         drop_orientations: Specific orientations to drop (0=Axial, 1=Coronal, 2=Sagittal). If specified, always drops these.
+        upsample_mode: Interpolation mode for FFT upsample recovery ('nearest', 'trilinear', 'nearest-exact')
         num_workers: Number of data loading workers
         use_cache: Whether to use CacheDataset
         use_wandb: Whether to use Weights & Biases for tracking
@@ -229,8 +231,6 @@ def train_uhved_model(
         min_orientations=min_orientations,
         drop_orientations=drop_orientations,
         upsample_mode=upsample_mode,
-        save_lr_stacks=save_lr_stacks,
-        lr_stack_output_dir=lr_stack_output_dir,
     )
 
     # Create dataset
@@ -977,12 +977,6 @@ if __name__ == "__main__":
                         choices=["nearest", "trilinear", "nearest-exact"],
                         help="Interpolation mode for FFT upsample recovery (default: nearest)")
 
-    # LR stack saving (for debugging/visualization)
-    parser.add_argument("--save_lr_stacks", action="store_true",
-                        help="Save LR stacks in both forms: before upsample (true LR) and after upsample")
-    parser.add_argument("--lr_stack_output_dir", type=str, default=None,
-                        help="Directory to save LR stacks (required if --save_lr_stacks is set)")
-
     # Other parameters
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint to resume from")
@@ -1018,10 +1012,6 @@ if __name__ == "__main__":
                   "Using deterministic dropout (--drop_orientations) and ignoring probability.")
         if len(args.drop_orientations) >= 3:
             raise ValueError("Cannot drop all 3 orientations. At least one must remain.")
-
-    # Validate LR stack saving settings
-    if args.save_lr_stacks and args.lr_stack_output_dir is None:
-        parser.error("--lr_stack_output_dir is required when --save_lr_stacks is set")
 
     # Validate loss weights when orientation reconstruction is disabled
     if args.no_reconstruct_orientations:
@@ -1125,4 +1115,5 @@ if __name__ == "__main__":
         reconstruct_orientations=not args.no_reconstruct_orientations,
         max_grad_norm=args.max_grad_norm,
         decoder_upsample_mode=args.decoder_upsample_mode,
+        upsample_mode=args.upsample_mode,
     )

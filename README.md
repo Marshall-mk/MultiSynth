@@ -1409,28 +1409,25 @@ python train.py \
 - `--val_patch_size`: Patch size for sliding window (default: [128, 128, 128])
 - `--val_overlap`: Overlap ratio for sliding window (default: 0.5)
 
+
 ## File Structure
 
 ```
 MultiSynth/
 ├── src/
-│   ├── data.py          # Data generation and augmentation
-│   ├── encoder.py       # Multi-modal encoder (U-HVED)
-│   ├── decoder.py       # Decoder with multiple upsample modes (U-HVED)
-│   ├── fusion.py        # Product of Gaussians fusion (U-HVED)
-│   ├── losses.py        # Loss functions (SSIM, 3D-LPIPS, perceptual)
-│   ├── uhved.py         # Main U-HVED model
-│   ├── unet.py          # 3D U-Net baseline model
-│   └── utils.py         # Utilities and config saving
-├── train.py             # U-HVED training script
-├── test.py              # U-HVED inference script
-├── evaluate.py          # U-HVED evaluation script
-├── train_unet.py        # U-Net training script (baseline)
-├── test_unet.py         # U-Net inference script
-├── evaluate_unet.py     # U-Net evaluation script
-├── example.py           # Demo script
-├── requirements.txt     # Dependencies
-└── README.md            # This file
+│   ├── data.py             # Data generation and augmentation
+│   ├── encoder.py          # Multi-modal encoder (U-HVED)
+│   ├── decoder.py          # Decoder with multiple upsample modes (U-HVED)
+│   ├── fusion.py           # Product of Gaussians fusion (U-HVED)
+│   ├── losses.py           # Loss functions (SSIM, 3D-LPIPS, perceptual)
+│   ├── uhved.py            # Main U-HVED model
+│   ├── unet.py             # 3D U-Net baseline model
+│   └── utils.py            # Utilities and config saving
+├── train.py                # U-HVED training script
+├── test.py                 # U-HVED inference script
+├── evaluate.py             # U-HVED evaluation script
+├── requirements.txt        # Dependencies
+└── README.md               # This file
 ```
 
 ## Requirements
@@ -1451,10 +1448,6 @@ Main dependencies:
 If you use this code, please cite:
 
 ```bibtex
-@article{uhved2024,
-  title={U-HVED: Hetero-Modal Variational Encoder-Decoder for Medical Image Super-Resolution},
-  author={Your Name},
-  journal={arXiv preprint},
-  year={2024}
+
 }
 ```

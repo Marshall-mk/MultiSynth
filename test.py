@@ -1,51 +1,3 @@
-"""
-U-HVED Inference Script for Orthogonal Stack Super-Resolution
-
-This script performs super-resolution on MRI volumes using the U-HVED model
-with orthogonal low-resolution stacks (axial, coronal, sagittal).
-
-Two modes are supported:
-1. Generate orthogonal LR stacks from a single HR volume (--input)
-2. Use pre-existing orthogonal LR stacks (--input_stacks)
-
-Usage:
-
-    # Mode 1: Generate stacks from HR volume (single file)
-    python test.py \
-        --input /path/to/hr_volume.nii.gz \
-        --output /path/to/output_sr.nii.gz \
-        --model ./models/uhved_orthogonal_best.pth \
-        --device cuda
-
-    # Mode 1: Batch inference on directory
-    python test.py \
-        --input /path/to/hr_volumes_dir \
-        --output /path/to/output_dir \
-        --model ./models/uhved_orthogonal_best.pth \
-        --device cuda \
-        --use_sliding_window \
-        --patch_size 128 128 128
-
-    # Mode 2: Use pre-existing 3 orthogonal LR stacks
-    python test.py \
-        --input_stacks lr_axial.nii.gz lr_coronal.nii.gz lr_sagittal.nii.gz \
-        --output /path/to/output_sr.nii.gz \
-        --model ./models/uhved_orthogonal_best.pth \
-        --device cuda
-
-    # Mode 2: With sliding window (for large volumes)
-    python test.py \
-        --input_stacks lr_axial.nii.gz lr_coronal.nii.gz lr_sagittal.nii.gz \
-        --output /path/to/output_sr.nii.gz \
-        --model ./models/uhved_orthogonal_best.pth \
-        --use_sliding_window \
-        --patch_size 96 96 96 \
-        --overlap 0.75 \
-        --device cuda
-
-License: Apache 2.0
-"""
-
 import os
 import argparse
 import torch
@@ -53,6 +5,7 @@ import numpy as np
 import nibabel as nib
 from pathlib import Path
 from tqdm import tqdm
+import gc
 
 from monai.transforms import (
     Compose,
@@ -67,9 +20,14 @@ from src.data import HRLRDataGenerator
 from src.utils import (
     pad_to_multiple_of_32,
     unpad_volume,
-    sliding_window_inference,
 )
 
+def cuda_cleanup():
+    """Best-effort GPU memory cleanup between cases."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    gc.collect()
 
 def get_resolution_from_affine(affine: np.ndarray) -> np.ndarray:
     """
@@ -360,52 +318,12 @@ def load_orthogonal_stacks_from_files(stack_paths, target_res=[1.0, 1.0, 1.0]):
     print(f"    Final stack shapes: {[s.shape for s in lr_stacks_tensors]}")
     return lr_stacks_tensors, metadata
 
-
-def generate_orthogonal_stacks(hr_volume, generator):
-    """
-    Generate 3 orthogonal LR stacks from HR volume.
-
-    Args:
-        hr_volume: High-resolution volume (D, H, W) or (C, D, H, W)
-        generator: HRLRDataGenerator instance
-
-    Returns:
-        List of 3 LR stacks (each as tensor with shape (C, D, H, W))
-    """
-    # Convert to tensor if needed
-    if isinstance(hr_volume, np.ndarray):
-        hr_volume = torch.from_numpy(hr_volume).float()
-
-    # Ensure we have batch and channel dimensions: (B, C, D, H, W)
-    if hr_volume.ndim == 3:
-        # (D, H, W) -> (1, 1, D, H, W)
-        hr_volume = hr_volume.unsqueeze(0).unsqueeze(0)
-    elif hr_volume.ndim == 4:
-        # (C, D, H, W) -> (1, C, D, H, W)
-        hr_volume = hr_volume.unsqueeze(0)
-
-    # Generate orthogonal stacks (simulates acquisition)
-    # This uses the same degradation pipeline as training
-    lr_stacks_list, _, orientation_mask = generator.generate_paired_data(hr_volume, return_resolution=False)
-
-    # lr_stacks_list is a list of 3 tensors, each with shape (B, C, D, H, W)
-    # Remove batch dimension and return as list
-    lr_stacks_tensors = [stack.squeeze(0) for stack in lr_stacks_list]
-
-    return lr_stacks_tensors
-
-
 def predict_single_volume(
     model,
-    input_path,
     output_path,
-    generator,
-    target_res=[1.0, 1.0, 1.0],
     device="cuda",
-    use_sliding_window=False,
-    patch_size=(128, 128, 128),
-    overlap=0.5,
     input_stack_paths=None,
+    target_res=[1.0, 1.0, 1.0],
     orientation_mask=None,
     save_reconstructions=False,
     reconstruction_dir=None,
@@ -415,71 +333,22 @@ def predict_single_volume(
 
     Args:
         model: Trained U-HVED model
-        input_path: Path to input NIfTI file (if generating stacks from HR)
         output_path: Path to save output
-        generator: HRLRDataGenerator for creating orthogonal stacks
-        target_res: Target resolution in mm [x, y, z]
         device: 'cuda' or 'cpu'
-        use_sliding_window: Use sliding window inference
-        patch_size: Patch size for sliding window (D, H, W)
-        overlap: Overlap ratio for sliding window
         input_stack_paths: Optional list of 3 pre-existing stack paths [axial, coronal, sagittal]
         orientation_mask: Optional binary mask [1/0, 1/0, 1/0] indicating which orientations are present
+
         save_reconstructions: Whether to save reconstructed orientations
         reconstruction_dir: Directory to save reconstructed orientations
     """
-    if input_stack_paths:
-        print(f"\nProcessing pre-existing orthogonal stacks:")
-        for i, path in enumerate(input_stack_paths):
-            print(f"  {['Axial', 'Coronal', 'Sagittal'][i]}: {path}")
-    else:
-        print(f"\nProcessing: {input_path}")
+    for i, path in enumerate(input_stack_paths):
+        print(f"  {['Axial', 'Coronal', 'Sagittal'][i]}: {path}")
 
-    # Two modes: load pre-existing stacks OR generate from HR volume
-    if input_stack_paths:
-        # Mode 1: Load 3 pre-existing orthogonal LR stacks WITH METADATA
-        lr_stacks, metadata = load_orthogonal_stacks_from_files(input_stack_paths, target_res)
-        # Use isotropic affine for output (matches resampled data)
-        affine = metadata['affine_isotropic']
 
-    else:
-        # Mode 2: Generate orthogonal stacks from single HR volume
-        # Load and preprocess with MONAI
-        print("  Loading and preprocessing...")
-        transforms = create_inference_transforms(target_res)
-        data_dict = {"image": input_path}
-        data = transforms(data_dict)
-
-        # Extract volume (dictionary-based transforms return dict)
-        volume = data["image"]
-
-        # Convert to numpy if tensor
-        if isinstance(volume, torch.Tensor):
-            volume_np = volume.cpu().numpy()
-        else:
-            volume_np = np.array(volume)
-
-        # Remove channel dimension for processing (C, D, H, W) -> (D, H, W)
-        if volume_np.ndim == 4 and volume_np.shape[0] == 1:
-            volume_np = volume_np[0]
-
-        print(f"  Input shape: {volume_np.shape}")
-
-        # Get affine for saving
-        # Load affine from original file
-        try:
-            original_img = nib.load(input_path)
-            affine = original_img.affine.copy()
-        except:
-            # Fallback to identity
-            affine = np.diag([target_res[0], target_res[1], target_res[2], 1.0])
-
-        # Normalize to [0, 1]
-        volume_np = (volume_np - volume_np.min()) / (volume_np.max() - volume_np.min() + 1e-8)
-
-        # Generate orthogonal LR stacks
-        print("  Generating orthogonal LR stacks...")
-        lr_stacks = generate_orthogonal_stacks(volume_np, generator)
+    # Mode 1: Load 3 pre-existing orthogonal LR stacks WITH METADATA
+    lr_stacks, metadata = load_orthogonal_stacks_from_files(input_stack_paths, target_res)
+    # Use isotropic affine for output (matches resampled data)
+    affine = metadata['affine_isotropic']
 
     # Pad to multiple of 32 if needed
     original_shape = lr_stacks[0].squeeze().shape
@@ -494,7 +363,6 @@ def predict_single_volume(
 
     # Move to device
     lr_stacks_padded = [stack.to(device) for stack in lr_stacks_padded]
-
     # Create orientation mask tensor
     if orientation_mask is not None:
         # Convert to boolean tensor
@@ -508,24 +376,9 @@ def predict_single_volume(
         print(f"  Using all 3 orientations")
 
     # Run inference
-    model.eval()
-    with torch.no_grad():
-        if use_sliding_window:
-            print(f"  Running sliding window inference (patch: {patch_size}, overlap: {overlap})...")
-            # Note: sliding_window_inference doesn't support orientation_mask yet
-            # TODO: Add orientation_mask support to sliding_window_inference
-            sr_output = sliding_window_inference(
-                model=model,
-                orientations=lr_stacks_padded,
-                patch_size=patch_size,
-                overlap=overlap,
-                batch_size=1,
-                device=device,
-                blend_mode="gaussian",
-                progress=True,
-            )
-            orientation_outputs = []  # Not available with sliding window
-        else:
+    try: 
+        model.eval()
+        with torch.no_grad():
             print("  Running standard inference...")
             outputs = model(lr_stacks_padded, orientation_mask=orientation_mask_tensor)
 
@@ -537,70 +390,76 @@ def predict_single_volume(
                 sr_output = outputs
                 orientation_outputs = []
 
-    # Convert SR output back to numpy
-    sr_output = sr_output.squeeze().cpu().numpy()  # (D, H, W)
-    print(f"  SR output shape before unpad: {sr_output.shape}")
+        # Convert SR output back to numpy
+        sr_output = sr_output.squeeze().cpu().numpy()  # (D, H, W)
+        print(f"  SR output shape before unpad: {sr_output.shape}")
 
-    # Unpad to original shape
-    sr_output = unpad_volume(sr_output, pad_before, orig_shape)
-    print(f"  SR output shape after unpad: {sr_output.shape}")
+        # Unpad to original shape
+        sr_output = unpad_volume(sr_output, pad_before, orig_shape)
+        print(f"  SR output shape after unpad: {sr_output.shape}")
 
-    # Denormalize (keep in 0-1 range, scale by original max)
-    sr_output = np.clip(sr_output, 0, 1)
+        # Denormalize (keep in 0-1 range, scale by original max)
+        sr_output = np.clip(sr_output, 0, 1)
 
-    # Save SR output
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    out_nii = nib.Nifti1Image(sr_output, affine)
-    nib.save(out_nii, output_path)
+        # Save SR output
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        out_nii = nib.Nifti1Image(sr_output, affine)
+        nib.save(out_nii, output_path)
 
-    # Log output information
-    output_res = get_resolution_from_affine(affine)
-    print(f"  ✓ SR output saved to: {output_path}")
-    print(f"    Output shape: {sr_output.shape}")
-    print(f"    Output resolution: [{output_res[0]:.2f}, {output_res[1]:.2f}, {output_res[2]:.2f}] mm")
-    print(f"    Output range: [{sr_output.min():.4f}, {sr_output.max():.4f}]")
+        # Log output information
+        output_res = get_resolution_from_affine(affine)
+        print(f"  ✓ SR output saved to: {output_path}")
+        print(f"    Output shape: {sr_output.shape}")
+        print(f"    Output resolution: [{output_res[0]:.2f}, {output_res[1]:.2f}, {output_res[2]:.2f}] mm")
+        print(f"    Output range: [{sr_output.min():.4f}, {sr_output.max():.4f}]")
 
-    # Save reconstructed orientations if requested
-    if save_reconstructions and len(orientation_outputs) > 0:
-        print(f"\n  Saving reconstructed orientations...")
+        # Save reconstructed orientations if requested
+        if save_reconstructions and len(orientation_outputs) > 0:
+            print(f"\n  Saving reconstructed orientations...")
 
-        # Determine output directory
-        if reconstruction_dir is None:
-            reconstruction_dir = os.path.dirname(output_path) or "."
-        os.makedirs(reconstruction_dir, exist_ok=True)
+            # Determine output directory
+            if reconstruction_dir is None:
+                reconstruction_dir = os.path.dirname(output_path) or "."
+            os.makedirs(reconstruction_dir, exist_ok=True)
 
-        # Get base filename
-        base_name = os.path.splitext(os.path.basename(output_path))[0]
-        if base_name.endswith('.nii'):
-            base_name = base_name[:-4]  # Remove .nii from .nii.gz
+            # Get base filename
+            base_name = os.path.splitext(os.path.basename(output_path))[0]
+            if base_name.endswith('.nii'):
+                base_name = base_name[:-4]  # Remove .nii from .nii.gz
 
-        orientation_names = ['axial', 'coronal', 'sagittal']
-        for i, recon in enumerate(orientation_outputs):
-            # Convert to numpy and unpad
-            recon_np = recon.squeeze().cpu().numpy()
-            recon_np = unpad_volume(recon_np, pad_before, orig_shape)
-            recon_np = np.clip(recon_np, 0, 1)
+            orientation_names = ['axial', 'coronal', 'sagittal']
+            for i, recon in enumerate(orientation_outputs):
+                # Convert to numpy and unpad
+                recon_np = recon.squeeze().cpu().numpy()
+                recon_np = unpad_volume(recon_np, pad_before, orig_shape)
+                recon_np = np.clip(recon_np, 0, 1)
 
-            # Save
-            recon_path = os.path.join(reconstruction_dir, f"{base_name}_recon_{orientation_names[i]}.nii.gz")
-            recon_nii = nib.Nifti1Image(recon_np, affine)
-            nib.save(recon_nii, recon_path)
-            print(f"    - {orientation_names[i]}: {recon_path}")
-    elif save_reconstructions and len(orientation_outputs) == 0:
-        print(f"  Note: Model was not trained with orientation reconstruction, skipping...")
+                # Save
+                recon_path = os.path.join(reconstruction_dir, f"{base_name}_recon_{orientation_names[i]}.nii.gz")
+                recon_nii = nib.Nifti1Image(recon_np, affine)
+                nib.save(recon_nii, recon_path)
+                print(f"    - {orientation_names[i]}: {recon_path}")
+        elif save_reconstructions and len(orientation_outputs) == 0:
+            print(f"  Note: Model was not trained with orientation reconstruction, skipping...")
+    
+    finally:
+        try:
+            del lr_stacks, lr_stacks_padded
+            if 'outputs' in locals(): del outputs
+            if 'sr_output' in locals(): del sr_output
+            if 'orientation_outputs' in locals(): del orientation_outputs
+            if 'orientation_mask_tensor' in locals(): del orientation_mask_tensor
+        except Exception:
+            pass
+        cuda_cleanup()
 
 
 
 def predict_batch(
-    input_paths,
     output_paths,
     model_path,
     target_res=[1.0, 1.0, 1.0],
-    output_shape=(128, 128, 128),
     device="cuda",
-    use_sliding_window=False,
-    patch_size=(128, 128, 128),
-    overlap=0.5,
     input_stack_paths=None,
     orientation_mask=None,
     save_reconstructions=False,
@@ -614,40 +473,13 @@ def predict_batch(
     # Load model
     model, checkpoint = load_uhved_from_checkpoint(model_path, device=device)
 
-    # Create data generator for orthogonal stacks (only needed if generating stacks)
-    generator = None
-    if not input_stack_paths:
-        print("\nInitializing data generator for orthogonal stacks...")
-        generator = HRLRDataGenerator(
-            atlas_res=target_res,
-            target_res=target_res,
-            output_shape=list(output_shape),
-            randomise_res=False,  # Fixed resolution for inference
-            prob_motion=0.0,      # No augmentation for inference
-            prob_spike=0.0,
-            prob_aliasing=0.0,
-            prob_bias_field=0.0,
-            prob_noise=0.0,
-            apply_intensity_aug=False,
-            clip_to_unit_range=True,
-            upsample_mode=upsample_mode,
-        )
-
     print(f"\nInference settings:")
     print(f"  Mode: {'Pre-existing stacks' if input_stack_paths else 'Generate from HR volume'}")
     print(f"  Device: {device}")
     print(f"  Target resolution: {target_res} mm")
-    if not input_stack_paths:
-        print(f"  Output shape: {output_shape}")
-    print(f"  Sliding window: {use_sliding_window}")
-    if use_sliding_window:
-        print(f"  Patch size: {patch_size}")
-        print(f"  Overlap: {overlap}")
 
     if input_stack_paths:
         print(f"\nProcessing 1 set of stacks...\n")
-    else:
-        print(f"\nProcessing {len(input_paths)} volumes...\n")
 
     # Process volume(s)
     if input_stack_paths:
@@ -656,14 +488,9 @@ def predict_batch(
         try:
             predict_single_volume(
                 model=model,
-                input_path=None,
                 output_path=output_paths[0] if isinstance(output_paths, list) else output_paths,
-                generator=generator,
                 target_res=target_res,
                 device=device,
-                use_sliding_window=use_sliding_window,
-                patch_size=patch_size,
-                overlap=overlap,
                 input_stack_paths=input_stack_paths,
                 orientation_mask=orientation_mask,
                 save_reconstructions=save_reconstructions,
@@ -673,48 +500,136 @@ def predict_batch(
             print(f"  ✗ ERROR: {str(e)}")
             import traceback
             traceback.print_exc()
-    else:
-        # Multiple volumes: generate stacks from each
-        for idx, (input_path, output_path) in enumerate(zip(input_paths, output_paths)):
-            print(f"[{idx + 1}/{len(input_paths)}]")
-            try:
-                predict_single_volume(
-                    model=model,
-                    input_path=input_path,
-                    output_path=output_path,
-                    generator=generator,
-                    target_res=target_res,
-                    device=device,
-                    use_sliding_window=use_sliding_window,
-                    patch_size=patch_size,
-                    overlap=overlap,
-                    input_stack_paths=None,
-                    orientation_mask=orientation_mask,
-                    save_reconstructions=save_reconstructions,
-                    reconstruction_dir=reconstruction_dir,
-                )
-            except Exception as e:
-                print(f"  ✗ ERROR: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                continue
 
     print("\n" + "=" * 80)
     print("Inference complete!")
     print("=" * 80)
 
+def predict_folder(
+    input_stacks_root: str,
+    output_root: str,
+    model_path: str,
+    target_res=[1.0, 1.0, 1.0],
+    device="cuda",
+    orientation_mask=None,
+    pattern_ax="axial_upsampled.nii.gz",
+    pattern_cor="coronal_upsampled.nii.gz",
+    pattern_sag="sagittal_upsampled.nii.gz",
+    output_name="model_wr_prediction.nii.gz",
+    skip_existing=False,
+    fail_fast=False,
+    save_reconstructions=False,
+    reconstruction_dir=None,
+):
+    """
+    Batch inference over a directory of subject folders.
+
+    Each subject folder is expected to contain:
+      - axial_upsampled.nii.gz
+      - coronal_upsampled.nii.gz
+      - sagittal_upsampled.nii.gz
+
+    orientation_mask controls which orientations are USED, even if files exist.
+    Missing masked-in files -> skip subject (or fail_fast).
+    Masked-out orientations are ignored (passed as None to the loader).
+    """
+    stacks_root = Path(input_stacks_root)
+    if not stacks_root.exists() or not stacks_root.is_dir():
+        raise ValueError(f"--input_stacks_root is not a directory: {stacks_root}")
+
+    out_root = Path(output_root) if output_root else stacks_root
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    # Default: use all 3
+    if orientation_mask is None:
+        orientation_mask = [1, 1, 1]
+
+    # Load model ONCE
+    model, checkpoint = load_uhved_from_checkpoint(model_path, device=device)
+
+    subject_dirs = sorted([p for p in stacks_root.iterdir() if p.is_dir()])
+    print(f"\nFound {len(subject_dirs)} subject folders in: {stacks_root}\n")
+
+    for i, subj_dir in enumerate(tqdm(subject_dirs, desc="Generating LR stacks"), start=1):
+        subj_id = subj_dir.name
+
+        ax = subj_dir / pattern_ax
+        cor = subj_dir / pattern_cor
+        sag = subj_dir / pattern_sag
+
+        # Build input_stack_paths with None placeholders to match your existing loader
+        # Index mapping: [Axial, Coronal, Sagittal]
+        stack_paths = [None, None, None]
+        file_candidates = [ax, cor, sag]
+
+        # Enforce mask: if mask=0, pass None even if file exists
+        # If mask=1, require file exists
+        missing_required = []
+        for idx, (m, p) in enumerate(zip(orientation_mask, file_candidates)):
+            if m == 1:
+                if p.exists():
+                    stack_paths[idx] = str(p)
+                else:
+                    missing_required.append(str(p))
+            else:
+                stack_paths[idx] = None
+
+        # Decide output path
+        out_path = out_root / subj_id / output_name if output_root else subj_dir / output_name
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if skip_existing and out_path.exists():
+            print(f"\n[{i}/{len(subject_dirs)}] {subj_id} -> skipping (exists): {out_path}")
+            continue
+
+        if missing_required:
+            msg = f"\n[{i}/{len(subject_dirs)}] {subj_id} -> skipping (missing required): {missing_required}"
+            if fail_fast:
+                raise FileNotFoundError(msg)
+            print(msg)
+            continue
+
+        print(f"\n[{i}/{len(subject_dirs)}] {subj_id}")
+        try:
+            # DEBUG
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"  GPU mem (before): allocated={allocated:.2f}GB reserved={reserved:.2f}GB")
+            predict_single_volume(
+                model=model,
+                output_path=str(out_path),
+                device=device,
+                input_stack_paths=stack_paths,
+                target_res=target_res,
+                orientation_mask=orientation_mask,
+                save_reconstructions=save_reconstructions,
+                reconstruction_dir=reconstruction_dir,
+            )
+            # DEBUG
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"  GPU mem (after):  allocated={allocated:.2f}GB reserved={reserved:.2f}GB")
+
+        except Exception as e:
+            print(f"  ✗ ERROR on {subj_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            if fail_fast:
+                raise
+
+    print("\nAll subjects done.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="U-HVED Inference with Orthogonal Stacks")
 
     # Input/output arguments
-    parser.add_argument("--input", type=str, required=False,
-                       help="Input image file or directory (single HR volume)")
     parser.add_argument("--input_stacks", type=str, nargs='+', default=None,
                        help="Orthogonal LR stack files (1-3 stacks). Provide in order: axial, coronal, sagittal. "
                             "If fewer than 3 stacks, you MUST also specify --orientation_mask to indicate which orientations are present. "
                             "Example: For axial+coronal only, use '--input_stacks axial.nii.gz coronal.nii.gz --orientation_mask 1 1 0'")
-    parser.add_argument("--output", type=str, required=True,
+    parser.add_argument("--output", type=str, required=False,
                        help="Output image file or directory")
 
     # Model arguments
@@ -724,21 +639,10 @@ if __name__ == "__main__":
     # Preprocessing arguments
     parser.add_argument("--target_res", type=float, nargs=3, default=[1.0, 1.0, 1.0],
                        help="Target resolution in mm (e.g., 1.0 1.0 1.0)")
-    parser.add_argument("--output_shape", type=int, nargs=3, default=[128, 128, 128],
-                       help="Output volume shape (e.g., 128 128 128)")
-    parser.add_argument("--upsample_mode", type=str, default="nearest",
-                       choices=["nearest", "trilinear", "nearest-exact"],
-                       help="Interpolation mode for FFT upsample recovery (default: nearest)")
 
     # Inference arguments
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device: cuda or cpu")
-    parser.add_argument("--use_sliding_window", action="store_true",
-                       help="Use sliding window inference (for large volumes)")
-    parser.add_argument("--patch_size", type=int, nargs=3, default=[128, 128, 128],
-                       help="Patch size for sliding window (e.g., 128 128 128)")
-    parser.add_argument("--overlap", type=float, default=0.5,
-                       help="Overlap ratio for sliding window (0.0-1.0)")
 
     # Orientation handling arguments
     parser.add_argument("--orientation_mask", type=int, nargs=3, default=None,
@@ -749,114 +653,130 @@ if __name__ == "__main__":
     parser.add_argument("--reconstruction_dir", type=str, default=None,
                        help="Directory to save reconstructed orientations (default: same as output directory)")
 
+    parser.add_argument("--input_stacks_root", type=str, default=None,
+                    help="Root dir containing subject subfolders of orthogonal stacks.")
+    parser.add_argument("--output_root", type=str, default=None,
+                        help="Where to save outputs for folder mode. If omitted, saves into each subject folder.")
+    parser.add_argument("--pattern_ax", type=str, default="axial_upsampled.nii.gz")
+    parser.add_argument("--pattern_cor", type=str, default="coronal_upsampled.nii.gz")
+    parser.add_argument("--pattern_sag", type=str, default="sagittal_upsampled.nii.gz")
+    parser.add_argument("--output_name", type=str, default="model_wr_prediction.nii.gz")
+    parser.add_argument("--skip_existing", action="store_true")
+    parser.add_argument("--fail_fast", action="store_true")
+
     args = parser.parse_args()
-
-    # Validate input arguments
-    if args.input_stacks and args.input:
-        raise ValueError("Cannot specify both --input and --input_stacks. Choose one mode.")
-
-    if not args.input_stacks and not args.input:
-        raise ValueError("Must specify either --input (for HR volume) or --input_stacks (for orthogonal LR stacks)")
 
     # Check device
     if args.device == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU")
         args.device = "cpu"
 
-    # Mode 1: Pre-existing orthogonal stacks
+    # -------------------------------
+    # Mode 0: Folder mode (batch over subject directories)
+    # -------------------------------
+    if getattr(args, "input_stacks_root", None):
+        # Default mask = use all orientations
+        if args.orientation_mask is None:
+            args.orientation_mask = [1, 1, 1]
+
+        predict_folder(
+            input_stacks_root=args.input_stacks_root,
+            output_root=getattr(args, "output_root", None),
+            model_path=args.model,
+            target_res=args.target_res,
+            device=args.device,
+            orientation_mask=args.orientation_mask,
+            pattern_ax=getattr(args, "pattern_ax", "axial_upsampled.nii.gz"),
+            pattern_cor=getattr(args, "pattern_cor", "coronal_upsampled.nii.gz"),
+            pattern_sag=getattr(args, "pattern_sag", "sagittal_upsampled.nii.gz"),
+            output_name=getattr(args, "output_name", "model_wr_prediction.nii.gz"),
+            skip_existing=getattr(args, "skip_existing", False),
+            fail_fast=getattr(args, "fail_fast", False),
+            save_reconstructions=args.save_reconstructions,
+            reconstruction_dir=args.reconstruction_dir,
+        )
+        raise SystemExit(0)
+
+    # -------------------------------
+    # Mode 1: Pre-existing orthogonal stacks (single case)
+    # -------------------------------
     if args.input_stacks:
-        # Validate number of stacks
         num_stacks = len(args.input_stacks)
-        if num_stacks < 1 or num_stacks > 3:
+        if not (1 <= num_stacks <= 3):
             raise ValueError(f"Expected 1-3 input stacks, got {num_stacks}")
 
-        # Validate that all stack files exist
+        # Validate provided stack files exist
         for i, stack_path in enumerate(args.input_stacks):
             if not Path(stack_path).exists():
-                raise ValueError(f"Stack {i+1} not found: {stack_path}")
+                raise ValueError(f"Provided stack {i+1} not found: {stack_path}")
 
-        # Handle partial stacks (fewer than 3)
-        if num_stacks < 3:
-            if args.orientation_mask is None:
+        # Normalize / validate orientation mask
+        if args.orientation_mask is None:
+            if num_stacks == 3:
+                args.orientation_mask = [1, 1, 1]
+            else:
                 raise ValueError(
                     f"When providing fewer than 3 stacks ({num_stacks} provided), "
                     "you MUST specify --orientation_mask to indicate which orientations are present.\n"
                     "Example: For axial+coronal, use: --orientation_mask 1 1 0"
                 )
+        else:
+            if len(args.orientation_mask) != 3:
+                raise ValueError(f"--orientation_mask must have 3 values (ax cor sag). Got: {args.orientation_mask}")
+            if any(v not in (0, 1) for v in args.orientation_mask):
+                raise ValueError(f"--orientation_mask values must be 0 or 1. Got: {args.orientation_mask}")
 
-            # Verify orientation_mask matches number of stacks
-            num_present = sum(args.orientation_mask)
+        num_present = sum(args.orientation_mask)
+        if num_present == 0:
+            raise ValueError("orientation_mask cannot be all zeros.")
+
+        # Build full [ax, cor, sag] list with None placeholders
+        # If 3 stacks provided, we assume order is [ax, cor, sag] and still allow mask to disable any.
+        if num_stacks < 3:
             if num_present != num_stacks:
                 raise ValueError(
                     f"Orientation mask indicates {num_present} present orientations, "
-                    f"but {num_stacks} stacks were provided. These must match!"
+                    f"but {num_stacks} stacks were provided. These must match!\n"
+                    "Tip: stacks are passed in the same order as the 1s in --orientation_mask "
+                    "(axial, coronal, sagittal)."
                 )
 
-            print(f"\n⚠️  Processing with {num_stacks}/3 orientations:")
-            present_names = [name for name, present in zip(['Axial', 'Coronal', 'Sagittal'], args.orientation_mask) if present]
-            print(f"   Present: {', '.join(present_names)}")
-
-            # Create full list with None placeholders for missing stacks
             input_stack_paths = [None, None, None]
             stack_idx = 0
             for i, present in enumerate(args.orientation_mask):
-                if present:
+                if present == 1:
                     input_stack_paths[i] = args.input_stacks[stack_idx]
                     stack_idx += 1
         else:
-            # All 3 stacks provided
-            input_stack_paths = args.input_stacks
-            # If orientation_mask not specified, default to all present
-            if args.orientation_mask is None:
-                args.orientation_mask = [1, 1, 1]
+            input_stack_paths = list(args.input_stacks)  # [ax, cor, sag]
+            for i, present in enumerate(args.orientation_mask):
+                if present == 0:
+                    input_stack_paths[i] = None
 
-        input_paths = None
-        output_paths = args.output
+        # Optional logging
+        names = ["Axial", "Coronal", "Sagittal"]
+        used = [n for n, p in zip(names, input_stack_paths) if p is not None]
+        print(f"\n📦 Stack mode: using {len(used)}/3 orientations -> {', '.join(used)}")
+        print(f"   orientation_mask = {args.orientation_mask}")
 
-    # Mode 2: Generate stacks from HR volume(s)
-    else:
-        input_path = Path(args.input)
-        output_path = Path(args.output)
-        input_stack_paths = None
+        # Run inference (single case)
+        predict_batch(
+            output_paths=args.output,  # if predict_batch expects list, change to [args.output]
+            model_path=args.model,
+            target_res=args.target_res,
+            device=args.device,
+            input_stack_paths=input_stack_paths,
+            orientation_mask=args.orientation_mask,
+            save_reconstructions=args.save_reconstructions,
+            reconstruction_dir=args.reconstruction_dir,
+        )
+        raise SystemExit(0)
 
-        if input_path.is_file():
-            # Single file
-            input_paths = [str(input_path)]
-            output_paths = [str(output_path)]
-        elif input_path.is_dir():
-            # Directory
-            input_paths = sorted(
-                [str(p) for p in input_path.glob("*.nii.gz")]
-                + [str(p) for p in input_path.glob("*.nii")]
-            )
-
-            if len(input_paths) == 0:
-                raise ValueError(f"No .nii or .nii.gz files found in {input_path}")
-
-            # Create output directory
-            output_path.mkdir(parents=True, exist_ok=True)
-
-            # Generate output paths
-            output_paths = [
-                str(output_path / (Path(ip).stem.replace(".nii", "") + "_sr.nii.gz"))
-                for ip in input_paths
-            ]
-        else:
-            raise ValueError(f"Input path does not exist: {input_path}")
-
-    # Run inference
-    predict_batch(
-        input_paths=input_paths,
-        output_paths=output_paths,
-        model_path=args.model,
-        target_res=args.target_res,
-        output_shape=tuple(args.output_shape),
-        device=args.device,
-        use_sliding_window=args.use_sliding_window,
-        patch_size=tuple(args.patch_size),
-        overlap=args.overlap,
-        input_stack_paths=input_stack_paths,
-        orientation_mask=args.orientation_mask,
-        save_reconstructions=args.save_reconstructions,
-        reconstruction_dir=args.reconstruction_dir,
+    # -------------------------------
+    # If no valid mode was chosen
+    # -------------------------------
+    raise ValueError(
+        "No valid inference mode selected. Use one of:\n"
+        "  - --input_stacks_root <dir>\n"
+        "  - --input_stacks <1-3 paths> (and possibly --orientation_mask)\n"
     )

@@ -1308,8 +1308,12 @@ class GeneratorDataset(torch.utils.data.Dataset):
         self.balanced_orientation_combos = balanced_orientation_combos
         self._orientation_combo_schedule = None
         self._epoch = 0
+        self._last_built_epoch = None
+        self._shared_epoch = None
 
         if self.balanced_orientation_combos:
+            import multiprocessing as mp
+            self._shared_epoch = mp.Value("i", 0)
             self._build_orientation_combo_schedule()
 
     def _build_orientation_combo_schedule(self) -> None:
@@ -1334,9 +1338,12 @@ class GeneratorDataset(torch.utils.data.Dataset):
         rng = random.Random(self._epoch)
         rng.shuffle(schedule)
         self._orientation_combo_schedule = schedule
+        self._last_built_epoch = self._epoch
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = epoch
+        if self._shared_epoch is not None:
+            self._shared_epoch.value = epoch
         if self.balanced_orientation_combos:
             self._build_orientation_combo_schedule()
 
@@ -1344,6 +1351,11 @@ class GeneratorDataset(torch.utils.data.Dataset):
         return len(self.base_dataset)
 
     def __getitem__(self, idx):
+        if self.balanced_orientation_combos and self._shared_epoch is not None:
+            shared_epoch = self._shared_epoch.value
+            if self._last_built_epoch != shared_epoch:
+                self._epoch = shared_epoch
+                self._build_orientation_combo_schedule()
         data = self.base_dataset[idx]
         hr_image = data["image"]
 

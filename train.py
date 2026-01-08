@@ -235,6 +235,7 @@ def train_uhved_model(
         min_orientations=min_orientations,
         drop_orientations=drop_orientations,
         upsample_mode=upsample_mode,
+        return_intermediate=False
     )
 
     # Create dataset

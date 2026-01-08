@@ -368,7 +368,7 @@ def main():
     print("Processing test volumes...")
     for img_path in tqdm(test_paths, desc="Generating LR stacks"):
         # Extract patient ID from filename
-        patient_id = Path(img_path).stem
+        patient_id = Path(img_path).stem.replace(".nii", "")
         patient_dir = output_dir / patient_id
 
         # Skip if exists and not overwrite

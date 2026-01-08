@@ -113,7 +113,7 @@ def load_uhved_from_checkpoint(checkpoint_path, device="cuda"):
     # Architectural parameters (with backward compatibility defaults)
     reconstruct_orientations = model_config.get('reconstruct_orientations', True)
     use_prior = model_config.get('use_prior', True)
-    use_encoder_outputs_as_skip = model_config.get('use_encoder_outputs_as_skip', True)
+    use_encoder_outputs_as_skip = model_config.get('use_encoder_outputs_as_skip', False)
     decoder_upsample_mode = model_config.get('decoder_upsample_mode', 'trilinear')
     final_activation = model_config.get('final_activation', 'sigmoid')
     share_encoder = model_config.get('share_encoder', False)

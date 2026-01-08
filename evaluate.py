@@ -189,6 +189,9 @@ def save_csv_results(
         aggregates: Aggregate statistics
         output_path: Path to save CSV file
     """
+    # Create output directory if it doesn't exist
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
     with open(output_path, 'w', newline='') as f:
         writer = csv.writer(f)
 
@@ -240,6 +243,9 @@ def save_json_results(
         output_path: Path to save JSON file
         metadata: Additional metadata to include
     """
+    # Create output directory if it doesn't exist
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
     output_data = {
         'metadata': metadata,
         'per_volume_results': [

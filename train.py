@@ -476,6 +476,8 @@ def train_uhved_model(
     # Training loop
     for epoch in range(start_epoch, epochs):
         epoch_start_time = time.time()
+        if hasattr(dataloader.dataset, "set_epoch"):
+            dataloader.dataset.set_epoch(epoch)
         model.train()
         epoch_loss = 0.0
         epoch_recon_loss = 0.0

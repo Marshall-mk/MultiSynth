@@ -72,6 +72,7 @@ def train_uhved_model(
     orientation_dropout_prob: float = 0.0,
     min_orientations: int = 1,
     drop_orientations: list = None,
+    balanced_orientation_combos: bool = False,
     num_workers: int = None,
     use_cache: bool = False,
     use_wandb: bool = False,
@@ -131,6 +132,7 @@ def train_uhved_model(
         orientation_dropout_prob: Probability of applying orientation dropout (0.0-1.0)
         min_orientations: Minimum number of orientations to keep after dropout (1-3)
         drop_orientations: Specific orientations to drop (0=Axial, 1=Coronal, 2=Sagittal). If specified, always drops these.
+        balanced_orientation_combos: Whether to use balanced orientation mask combos per epoch.
         upsample_mode: Interpolation mode for FFT upsample recovery ('nearest', 'trilinear', 'nearest-exact')
         num_workers: Number of data loading workers
         use_cache: Whether to use CacheDataset
@@ -212,6 +214,8 @@ def train_uhved_model(
         if orientation_dropout_prob > 0.0:
             print(f"orientation dropout enabled: {orientation_dropout_prob:.2f} probability, min {min_orientations} orientations")
             print(f"  → Training will randomly drop views to simulate missing data")
+        if balanced_orientation_combos:
+            print("Balanced orientation combos enabled per epoch")
 
     generator = HRLRDataGenerator(
         atlas_res=atlas_res,
@@ -242,6 +246,7 @@ def train_uhved_model(
         use_cache=use_cache,
         return_resolution=True,
         is_training=True,
+        balanced_orientation_combos=balanced_orientation_combos,
     )
 
     # Create DataLoader
@@ -268,6 +273,7 @@ def train_uhved_model(
             use_cache=use_cache,
             return_resolution=True,
             is_training=False,
+            balanced_orientation_combos=False,
         )
 
         val_dataloader = DataLoader(
@@ -435,6 +441,7 @@ def train_uhved_model(
             "kl_weight": kl_weight,
             "perceptual_weight": perceptual_weight,
             "orientation_weight": orientation_weight,
+            "balanced_orientation_combos": balanced_orientation_combos,
             "reconstruct_orientations": reconstruct_orientations,
             "model_parameters": sum(p.numel() for p in model.parameters()),
             "n_train_samples": len(hr_image_paths),
@@ -756,6 +763,7 @@ def train_uhved_model(
                     "ssim_weight": ssim_weight,
                     "perceptual_weight": perceptual_weight,
                     "orientation_weight": orientation_weight,
+                    "balanced_orientation_combos": balanced_orientation_combos,
                 }
 
                 unwrapped_model = accelerator.unwrap_model(model)
@@ -805,6 +813,7 @@ def train_uhved_model(
                     "kl_weight": kl_weight,
                     "perceptual_weight": perceptual_weight,
                     "orientation_weight": orientation_weight,
+                    "balanced_orientation_combos": balanced_orientation_combos,
                 }
 
                 unwrapped_model = accelerator.unwrap_model(model)
@@ -854,6 +863,7 @@ def train_uhved_model(
             "kl_weight": kl_weight,
             "perceptual_weight": perceptual_weight,
             "orientation_weight": orientation_weight,
+            "balanced_orientation_combos": balanced_orientation_combos,
         }
 
         unwrapped_model = accelerator.unwrap_model(model)
@@ -971,6 +981,11 @@ if __name__ == "__main__":
                         help="Specific orientations to drop (0=Axial, 1=Coronal, 2=Sagittal). "
                              "If specified, these orientations will ALWAYS be dropped. "
                              "Mutually exclusive with random orientation_dropout_prob.")
+    parser.add_argument(
+        "--balanced_orientation_combos",
+        action="store_true",
+        help="Use balanced orientation mask combos per epoch for training.",
+    )
     parser.add_argument("--no_reconstruct_orientations", action="store_true",
                         help="Disable orientation reconstruction (SR decoder only, for ablation studies)")
 
@@ -1088,6 +1103,7 @@ if __name__ == "__main__":
         orientation_dropout_prob=args.orientation_dropout_prob,
         min_orientations=args.min_orientations,
         drop_orientations=args.drop_orientations,
+        balanced_orientation_combos=args.balanced_orientation_combos,
         num_workers=args.num_workers,
         use_cache=args.use_cache,
         use_wandb=args.use_wandb,

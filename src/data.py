@@ -1295,15 +1295,67 @@ class GeneratorDataset(torch.utils.data.Dataset):
     - lr_coronal: High resolution in height (H) axis
     - lr_sagittal: High resolution in width (W) axis
     """
-    def __init__(self, base_dataset, generator, return_resolution):
+    def __init__(
+        self,
+        base_dataset,
+        generator,
+        return_resolution,
+        balanced_orientation_combos: bool = False,
+    ):
         self.base_dataset = base_dataset
         self.generator = generator
         self.return_resolution = return_resolution
+        self.balanced_orientation_combos = balanced_orientation_combos
+        self._orientation_combo_schedule = None
+        self._epoch = 0
+        self._last_built_epoch = None
+        self._shared_epoch = None
+
+        if self.balanced_orientation_combos:
+            import multiprocessing as mp
+            self._shared_epoch = mp.Value("i", 0)
+            self._build_orientation_combo_schedule()
+
+    def _build_orientation_combo_schedule(self) -> None:
+        import random
+
+        combos = [
+            torch.tensor([1, 0, 1], dtype=torch.bool),  # ax+sag
+            torch.tensor([1, 1, 0], dtype=torch.bool),  # ax+cor
+            torch.tensor([0, 1, 1], dtype=torch.bool),  # cor+sag
+            torch.tensor([1, 1, 1], dtype=torch.bool),  # all three
+        ]
+        total = len(self.base_dataset)
+        base_count = total // len(combos)
+        remainder = total % len(combos)
+
+        schedule = []
+        for combo in combos:
+            schedule.extend([combo.clone() for _ in range(base_count)])
+        for i in range(remainder):
+            schedule.append(combos[i].clone())
+
+        rng = random.Random(self._epoch)
+        rng.shuffle(schedule)
+        self._orientation_combo_schedule = schedule
+        self._last_built_epoch = self._epoch
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+        if self._shared_epoch is not None:
+            self._shared_epoch.value = epoch
+        if self.balanced_orientation_combos:
+            self._build_orientation_combo_schedule()
 
     def __len__(self):
         return len(self.base_dataset)
 
     def __getitem__(self, idx):
+        if self.balanced_orientation_combos and self._shared_epoch is not None:
+            shared_epoch = self._shared_epoch.value
+            if self._last_built_epoch != shared_epoch:
+                self._epoch = shared_epoch
+                self._build_orientation_combo_schedule()
         data = self.base_dataset[idx]
         hr_image = data["image"]
 
@@ -1326,6 +1378,8 @@ class GeneratorDataset(torch.utils.data.Dataset):
 
         if self.return_resolution:
             lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask = result
+            if self.balanced_orientation_combos:
+                orientation_mask = self._orientation_combo_schedule[idx]
             # lr_stacks is a list of 3 tensors, each (1, C, D, H, W)
             # Return them as separate orientations
             return (
@@ -1337,6 +1391,8 @@ class GeneratorDataset(torch.utils.data.Dataset):
             )
         else:
             lr_stacks, hr_augmented, orientation_mask = result
+            if self.balanced_orientation_combos:
+                orientation_mask = self._orientation_combo_schedule[idx]
             # Return the three LR stacks as a list
             return (
                 [stack.squeeze(0) for stack in lr_stacks],
@@ -1353,6 +1409,7 @@ def create_dataset(
     use_cache: bool = False,
     return_resolution: bool = False,
     is_training: bool = True,
+    balanced_orientation_combos: bool = False,
 ):
     """
     Creates the training dataset using HRLRDataGenerator.
@@ -1398,5 +1455,9 @@ def create_dataset(
     else:
         dataset = Dataset(data=data_dicts, transform=transform)
 
-    return GeneratorDataset(dataset, generator, return_resolution)
-
+    return GeneratorDataset(
+        dataset,
+        generator,
+        return_resolution,
+        balanced_orientation_combos=balanced_orientation_combos,
+    )

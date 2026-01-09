@@ -32,7 +32,7 @@ from transformers import get_cosine_schedule_with_warmup
 from monai.data import DataLoader
 
 # Import our modules
-from src import UHVED, UHVEDLoss, create_uhved
+from src import UHVED, UHVEDLoss
 from src.data import HRLRDataGenerator, create_dataset
 from src.utils import (
     save_model_checkpoint,
@@ -42,7 +42,6 @@ from src.utils import (
     calculate_metrics,
     sliding_window_inference,
     print_model_statistics,
-    get_gpu_memory_stats,
     print_gpu_memory_stats,
 )
 
@@ -92,7 +91,8 @@ def train_uhved_model(
     orientation_weight: float = 0.4,
     use_perceptual: bool = False,
     use_ssim: bool = True,
-    perceptual_backend: str = 'medicalnet',
+    perceptual_network: str = 'alex',
+    is_fake_3d: bool = False,
     use_sliding_window_val: bool = False,
     val_patch_size: tuple = (128, 128, 128),
     val_overlap: float = 0.5,
@@ -153,7 +153,8 @@ def train_uhved_model(
         orientation_weight: Weight for orientation reconstruction loss
         use_perceptual: Whether to use perceptual loss
         use_ssim: Whether to use SSIM loss
-        perceptual_backend: Backend for perceptual loss ('medicalnet' or 'monai', 'models_genesis')
+        perceptual_network: MONAI network for perceptual loss ('alex', 'vgg', 'squeeze', 'radimagenet', 'medicalnet', 'resnet50')
+        is_fake_3d: Use 2.5D (fake 3D) mode for perceptual loss (False = full 3D, True = 2.5D slices)
         use_sliding_window_val: Use sliding window inference for validation
         val_patch_size: Patch size for sliding window validation
         val_overlap: Overlap ratio for sliding window validation
@@ -363,7 +364,8 @@ def train_uhved_model(
         orientation_weight=orientation_weight,
         use_perceptual=use_perceptual,
         use_ssim=use_ssim,
-        perceptual_backend=perceptual_backend,
+        perceptual_network=perceptual_network,
+        is_fake_3d=is_fake_3d,
     )
 
     if accelerator.is_main_process:
@@ -763,6 +765,8 @@ def train_uhved_model(
                     "recon_weight": recon_weight,
                     "ssim_weight": ssim_weight,
                     "perceptual_weight": perceptual_weight,
+                    "perceptual_network": perceptual_network,
+                    "is_fake_3d": is_fake_3d,
                     "orientation_weight": orientation_weight,
                     "balanced_orientation_combos": balanced_orientation_combos,
                 }
@@ -812,7 +816,11 @@ def train_uhved_model(
                 training_config = {
                     "learning_rate": learning_rate,
                     "kl_weight": kl_weight,
+                    "recon_weight": recon_weight,
+                    "ssim_weight": ssim_weight,
                     "perceptual_weight": perceptual_weight,
+                    "perceptual_network": perceptual_network,
+                    "is_fake_3d": is_fake_3d,
                     "orientation_weight": orientation_weight,
                     "balanced_orientation_combos": balanced_orientation_combos,
                 }
@@ -862,7 +870,11 @@ def train_uhved_model(
         training_config = {
             "learning_rate": learning_rate,
             "kl_weight": kl_weight,
+            "recon_weight": recon_weight,
+            "ssim_weight": ssim_weight,
             "perceptual_weight": perceptual_weight,
+            "perceptual_network": perceptual_network,
+            "is_fake_3d": is_fake_3d,
             "orientation_weight": orientation_weight,
             "balanced_orientation_combos": balanced_orientation_combos,
         }
@@ -954,8 +966,11 @@ if __name__ == "__main__":
     parser.add_argument("--orientation_weight", type=float, default=0.4, help="orientation reconstruction weight")
     parser.add_argument("--use_perceptual", action="store_true", help="Use perceptual loss")
     parser.add_argument("--use_ssim", action="store_true", help="Use SSIM loss")
-    parser.add_argument("--perceptual_backend", type=str, default="medicalnet",
-                        choices=["medicalnet", "monai", "models_genesis"], help="Perceptual loss backend")
+    parser.add_argument("--perceptual_network", type=str, default="alex",
+                        choices=["alex", "vgg", "squeeze", "radimagenet", "medicalnet", "resnet50"],
+                        help="Perceptual loss network (MONAI) - default: alex for fast LPIPS")
+    parser.add_argument("--is_fake_3d", action="store_true",
+                        help="Use 2.5D (fake 3D) mode for perceptual loss (faster, lower memory)")
 
     # Data generation parameters
     parser.add_argument("--atlas_res", type=float, nargs=3, default=[1.0, 1.0, 1.0], help="HR resolution")
@@ -1124,7 +1139,8 @@ if __name__ == "__main__":
         orientation_weight=args.orientation_weight,
         use_perceptual=args.use_perceptual,
         use_ssim=args.use_ssim,
-        perceptual_backend=args.perceptual_backend,
+        perceptual_network=args.perceptual_network,
+        is_fake_3d=args.is_fake_3d,
         use_sliding_window_val=args.use_sliding_window_val,
         val_patch_size=tuple(args.val_patch_size),
         val_overlap=args.val_overlap,

@@ -9,7 +9,6 @@ from .decoder import ConvDecoder
 from .fusion import ProductOfGaussians
 
 from .losses import (
-    PerceptualLoss3D,
     SSIM3DLoss,
     UHVEDLoss,
     create_uhved_loss
@@ -23,7 +22,6 @@ __all__ = [
     'ConvEncoder',
     'ConvDecoder',
     'ProductOfGaussians',
-    'PerceptualLoss3D',
     'SSIM3DLoss',
     'UHVEDLoss',
     'create_uhved_loss'

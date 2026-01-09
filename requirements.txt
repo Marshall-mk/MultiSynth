@@ -8,6 +8,7 @@ torchviz
 graphviz
 wandb
 monai
+lpips
 transformers
 accelerate
 tqdm

@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from typing import List, Tuple, Optional, Dict, Literal
 from torchvision import models
 import warnings
+from monai.losses import PerceptualLoss, SSIMLoss
 
 class KLDivergence(nn.Module):
     """
@@ -221,309 +222,6 @@ class AdversarialLoss(nn.Module):
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
 
-class PerceptualLoss3D(nn.Module):
-    """
-    3D Perceptual loss using pretrained 3D medical imaging models.
-
-    Supports three backend options:
-    1. 'medicalnet': 3D ResNet from MedicalNet (Tencent)
-    2. 'monai': Self-supervised models from MONAI
-    3. 'models_genesis': Self-supervised U-Net from Models Genesis
-
-    Each backend extracts hierarchical features from 3D volumes and
-    computes feature-space reconstruction loss.
-    """
-
-    def __init__(
-        self,
-        backend: Literal['medicalnet', 'monai', 'models_genesis'] = 'medicalnet',
-        model_depth: int = 18,
-        feature_layers: List[str] = None,
-        weights: List[float] = None,
-        pretrained: bool = True,
-        normalize_input: bool = True,
-        freeze_backbone: bool = True
-    ):
-        """
-        Args:
-            backend: Which 3D pretrained model to use
-                - 'medicalnet': 3D ResNet (10, 18, 34, 50, 101)
-                - 'monai': MONAI's pretrained models
-                - 'models_genesis': Models Genesis pretrained U-Net
-            model_depth: Depth of ResNet for MedicalNet (10, 18, 34, 50, 101)
-            feature_layers: Which layers to extract features from
-            weights: Weights for each layer's loss contribution
-            pretrained: Whether to load pretrained weights
-            normalize_input: Whether to normalize input to expected range
-            freeze_backbone: Whether to freeze backbone parameters
-        """
-        super().__init__()
-
-        self.backend = backend
-        self.normalize_input = normalize_input
-
-        if feature_layers is None:
-            feature_layers = ['layer1', 'layer2', 'layer3']
-        if weights is None:
-            weights = [1.0] * len(feature_layers)
-
-        self.feature_layers = feature_layers
-        self.weights = weights
-
-        # Initialize backbone based on selected backend
-        if backend == 'medicalnet':
-            self.backbone = self._build_medicalnet_backbone(model_depth, pretrained)
-        elif backend == 'monai':
-            self.backbone = self._build_monai_backbone(pretrained)
-        elif backend == 'models_genesis':
-            self.backbone = self._build_models_genesis_backbone(pretrained)
-        else:
-            raise ValueError(f"Unknown backend: {backend}. Choose from ['medicalnet', 'monai', 'models_genesis']")
-
-        # Freeze backbone if requested
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-
-        # Hook storage for intermediate features
-        self.features = {}
-        self._register_hooks()
-
-    def _build_medicalnet_backbone(self, depth: int, pretrained: bool) -> nn.Module:
-        """
-        Build MedicalNet 3D ResNet backbone.
-
-        MedicalNet provides 3D ResNet models pretrained on medical imaging datasets.
-        GitHub: https://github.com/Tencent/MedicalNet
-        """
-        try:
-            # Try to import MedicalNet models
-            # Note: User needs to install MedicalNet separately
-            from medicalnet import resnet
-
-            if depth == 10:
-                model = resnet.resnet10(sample_input_D=64, sample_input_H=64, sample_input_W=64, num_seg_classes=1)
-            elif depth == 18:
-                model = resnet.resnet18(sample_input_D=64, sample_input_H=64, sample_input_W=64, num_seg_classes=1)
-            elif depth == 34:
-                model = resnet.resnet34(sample_input_D=64, sample_input_H=64, sample_input_W=64, num_seg_classes=1)
-            elif depth == 50:
-                model = resnet.resnet50(sample_input_D=64, sample_input_H=64, sample_input_W=64, num_seg_classes=1)
-            elif depth == 101:
-                model = resnet.resnet101(sample_input_D=64, sample_input_H=64, sample_input_W=64, num_seg_classes=1)
-            else:
-                raise ValueError(f"Unsupported depth {depth}. Choose from [10, 18, 34, 50, 101]")
-
-            if pretrained:
-                # User needs to download pretrained weights from MedicalNet GitHub
-                warnings.warn(
-                    "Pretrained MedicalNet weights need to be downloaded manually from "
-                    "https://github.com/Tencent/MedicalNet/tree/master/pretrain\n"
-                    "Set pretrained=False or load weights manually with model.load_state_dict()"
-                )
-
-            return model
-
-        except ImportError:
-            raise ImportError(
-                "MedicalNet not found. Install it with:\n"
-                "  git clone https://github.com/Tencent/MedicalNet.git\n"
-                "  cd MedicalNet\n"
-                "  pip install -e .\n"
-                "Or choose a different backend: 'monai' or 'models_genesis'"
-            )
-
-    def _build_monai_backbone(self, pretrained: bool) -> nn.Module:
-        """
-        Build MONAI pretrained 3D backbone.
-
-        MONAI provides various pretrained 3D models including ResNet, DenseNet, etc.
-        """
-        try:
-            from monai.networks.nets import ResNet
-            from monai.networks.layers import Norm
-
-            # Create 3D ResNet50
-            model = ResNet(
-                spatial_dims=3,
-                n_input_channels=1,
-                num_classes=1,
-                block='bottleneck',
-                layers=[3, 4, 6, 3],  # ResNet-50 configuration
-                block_inplanes=[64, 128, 256, 512],
-                norm=Norm.BATCH,
-            )
-
-            if pretrained:
-                # MONAI pretrained weights can be loaded from MONAI Model Zoo
-                warnings.warn(
-                    "For pretrained MONAI models, use MONAI Model Zoo:\n"
-                    "  from monai.bundle import download\n"
-                    "  download(name='model_name', bundle_dir='./pretrained')\n"
-                    "See: https://monai.io/model-zoo.html"
-                )
-
-            return model
-
-        except ImportError:
-            raise ImportError(
-                "MONAI not found. Install it with:\n"
-                "  pip install monai\n"
-                "Or choose a different backend: 'medicalnet' or 'models_genesis'"
-            )
-
-    def _build_models_genesis_backbone(self, pretrained: bool) -> nn.Module:
-        """
-        Build Models Genesis pretrained 3D U-Net backbone.
-
-        Models Genesis provides self-supervised pretrained models for medical imaging.
-        GitHub: https://github.com/MrGiovanni/ModelsGenesis
-        """
-        try:
-            # Try to import Models Genesis
-            from models_genesis import UNet3D
-
-            model = UNet3D(in_channels=1, out_channels=1)
-
-            if pretrained:
-                warnings.warn(
-                    "Pretrained Models Genesis weights need to be downloaded from:\n"
-                    "https://github.com/MrGiovanni/ModelsGenesis/tree/master/pytorch\n"
-                    "Download Genesis_Chest_CT.pt or other pretrained weights"
-                )
-
-            return model
-
-        except ImportError:
-            # Fallback: Create a simple 3D U-Net encoder
-            warnings.warn(
-                "Models Genesis not found. Using a simple 3D encoder instead.\n"
-                "For better performance, install Models Genesis:\n"
-                "  git clone https://github.com/MrGiovanni/ModelsGenesis.git\n"
-                "  cd ModelsGenesis/pytorch\n"
-                "  pip install -e .\n"
-                "Or choose a different backend: 'medicalnet' or 'monai'"
-            )
-            return self._build_simple_3d_encoder()
-
-    def _build_simple_3d_encoder(self) -> nn.Module:
-        """Fallback: Simple 3D encoder if specialized models unavailable."""
-        return nn.Sequential(
-            # Layer 1
-            nn.Conv3d(1, 64, kernel_size=3, padding=1),
-            nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
-
-            # Layer 2
-            nn.Conv3d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm3d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm3d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
-
-            # Layer 3
-            nn.Conv3d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm3d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(256, 256, kernel_size=3, padding=1),
-            nn.BatchNorm3d(256),
-            nn.ReLU(inplace=True),
-        )
-
-    def _register_hooks(self):
-        """Register forward hooks to extract intermediate features."""
-        def get_hook(name):
-            def hook(module, input, output):
-                self.features[name] = output
-            return hook
-
-        # Register hooks based on backend
-        if self.backend in ['medicalnet', 'monai']:
-            # For ResNet-like architectures
-            for name, module in self.backbone.named_modules():
-                if any(layer_name in name for layer_name in self.feature_layers):
-                    module.register_forward_hook(get_hook(name))
-        else:
-            # For U-Net or simple encoder
-            for idx, (name, module) in enumerate(self.backbone.named_children()):
-                if f'layer{idx//3 + 1}' in self.feature_layers:
-                    module.register_forward_hook(get_hook(f'layer{idx//3 + 1}'))
-
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize input to expected range for medical imaging models."""
-        # Most medical imaging models expect inputs in [0, 1] or [-1, 1]
-        # Adjust based on model expectations
-        if x.min() < 0:
-            # Already in [-1, 1], normalize to [0, 1]
-            x = (x + 1) / 2
-
-        # Clip to valid range
-        x = torch.clamp(x, 0, 1)
-
-        return x
-
-    def extract_features(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Extract features from input volume."""
-        if self.normalize_input:
-            x = self._normalize(x)
-
-        # Clear previous features
-        self.features = {}
-
-        # Forward pass (hooks will populate self.features)
-        _ = self.backbone(x)
-
-        return self.features
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute 3D perceptual loss.
-
-        Args:
-            pred: Predicted volume (B, C, D, H, W)
-            target: Ground truth volume (B, C, D, H, W)
-
-        Returns:
-            Perceptual loss (scalar)
-        """
-        # Extract features from both volumes
-        pred_features = self.extract_features(pred)
-        target_features = self.extract_features(target)
-
-        # Compute loss at each layer
-        loss = 0.0
-        for layer_name, weight in zip(self.feature_layers, self.weights):
-            # Find matching features
-            pred_feat = None
-            target_feat = None
-
-            for name, feat in pred_features.items():
-                if layer_name in name:
-                    pred_feat = feat
-                    break
-
-            for name, feat in target_features.items():
-                if layer_name in name:
-                    target_feat = feat
-                    break
-
-            if pred_feat is not None and target_feat is not None:
-                # L1 loss in feature space
-                loss = loss + weight * F.l1_loss(pred_feat, target_feat)
-
-        return loss
-
-
 class SSIM3DLoss(nn.Module):
     """
     3D Structural Similarity Index (SSIM) loss using MONAI.
@@ -541,19 +239,10 @@ class SSIM3DLoss(nn.Module):
             spatial_dims: Number of spatial dimensions (3 for 3D volumes)
         """
         super().__init__()
+        self.ssim_loss = SSIMLoss(
+            spatial_dims=spatial_dims,
 
-        try:
-            from monai.losses import SSIMLoss
-            self.ssim_loss = SSIMLoss(
-                spatial_dims=spatial_dims,
-
-            )
-
-        except ImportError:
-            raise ImportError(
-                "MONAI not found. Install it with:\n"
-                "  pip install monai"
-            )
+        )
 
     def forward(
         self,
@@ -600,8 +289,8 @@ class UHVEDLoss(nn.Module):
         orientation_weight: float = 0.5,
         use_perceptual: bool = True,
         use_ssim: bool = False,
-        perceptual_backend: Literal['medicalnet', 'monai', 'models_genesis'] = 'medicalnet',
-        perceptual_model_depth: int = 18,
+        perceptual_network: str = 'alex',
+        is_fake_3d: bool = False,
         kl_annealing: bool = True,
         kl_anneal_steps: int = 10000
     ):
@@ -615,11 +304,16 @@ class UHVEDLoss(nn.Module):
             orientation_weight: Weight for orientation reconstruction loss
             use_perceptual: Whether to use 3D perceptual loss
             use_ssim: Whether to use 3D SSIM loss
-            perceptual_backend: Which 3D model to use for perceptual loss
-                - 'medicalnet': 3D ResNet from MedicalNet
-                - 'monai': MONAI pretrained models
-                - 'models_genesis': Models Genesis U-Net
-            perceptual_model_depth: Depth of ResNet for MedicalNet (10, 18, 34, 50, 101)
+            perceptual_network: MONAI network for perceptual loss
+                - 'alex': AlexNet (default, lightweight LPIPS standard)
+                - 'vgg': VGG network
+                - 'squeeze': SqueezeNet
+                - 'radimagenet': RadImageNet pretrained
+                - 'medicalnet': MedicalNet pretrained
+                - 'resnet50': ResNet-50
+            is_fake_3d: Use 2.5D (fake 3D) mode for perceptual loss
+                - False: Full 3D processing (default, more accurate)
+                - True: 2.5D slice-based processing (faster, lower memory)
             kl_annealing: Whether to anneal KL weight
             kl_anneal_steps: Number of steps for KL annealing
         """
@@ -642,12 +336,20 @@ class UHVEDLoss(nn.Module):
         # 3D Perceptual loss
         if use_perceptual:
             try:
-                self.perceptual_loss = PerceptualLoss3D(
-                    backend=perceptual_backend,
-                    model_depth=perceptual_model_depth,
+                self.perceptual_loss = PerceptualLoss(
+                    spatial_dims=3,
+                    network_type=perceptual_network,
+                    is_fake_3d=is_fake_3d,
                     pretrained=True
                 )
-                print(f"✓ 3D Perceptual Loss initialized with backend: {perceptual_backend}")
+                mode_str = "2.5D (fake 3D)" if is_fake_3d else "full 3D"
+                print(f"✓ MONAI Perceptual Loss initialized with network: {perceptual_network} ({mode_str})")
+            except ImportError:
+                raise ImportError(
+                    "MONAI PerceptualLoss not found. Please install/update MONAI:\n"
+                    "  pip install --upgrade monai\n"
+                    "MONAI >= 1.3.0 required"
+                )
             except Exception as e:
                 warnings.warn(f"Failed to initialize 3D perceptual loss: {e}")
                 self.perceptual_loss = None
@@ -676,6 +378,16 @@ class UHVEDLoss(nn.Module):
         # Linear annealing from 0 to kl_weight
         progress = min(self.current_step.item() / self.kl_anneal_steps, 1.0)
         return self.kl_weight * progress
+
+    def _maybe_move_perceptual(self, device: torch.device) -> None:
+        if not isinstance(self.perceptual_loss, nn.Module):
+            return
+        ref_tensor = next(self.perceptual_loss.parameters(), None)
+        if ref_tensor is None:
+            ref_tensor = next(self.perceptual_loss.buffers(), None)
+        if ref_tensor is None or ref_tensor.device == device:
+            return
+        self.perceptual_loss.to(device)
 
     def forward(
         self,
@@ -712,6 +424,7 @@ class UHVEDLoss(nn.Module):
         # 3D Perceptual loss
         if self.perceptual_loss is not None:
             try:
+                self.perceptual_loss.to(sr_output.device)
                 losses['perceptual'] = self.perceptual_loss(sr_output, sr_target) * self.perceptual_weight
             except Exception as e:
                 warnings.warn(f"Perceptual loss computation failed: {e}")
@@ -755,7 +468,7 @@ class UHVEDLoss(nn.Module):
 
 # Convenience function to create 3D loss
 def create_uhved_loss(
-    backend: str = 'medicalnet',
+    network_type: str = 'alex',
     use_perceptual: bool = True,
     use_ssim: bool = False,
     **kwargs
@@ -764,7 +477,8 @@ def create_uhved_loss(
     Factory function to create UHVEDLoss with sensible defaults.
 
     Args:
-        backend: Which 3D backbone to use ('medicalnet', 'monai', 'models_genesis')
+        network_type: MONAI network type ('alex', 'vgg', 'squeeze',
+                     'radimagenet', 'medicalnet', 'resnet50')
         use_perceptual: Whether to use 3D perceptual loss
         use_ssim: Whether to use 3D SSIM loss
         **kwargs: Additional arguments for UHVEDLoss
@@ -776,19 +490,19 @@ def create_uhved_loss(
         >>> # Basic usage with L1 + KL only
         >>> loss_fn = create_uhved_loss(use_perceptual=False, use_ssim=False)
 
-        >>> # With MedicalNet perceptual loss
-        >>> loss_fn = create_uhved_loss(backend='medicalnet', use_perceptual=True)
+        >>> # With AlexNet perceptual loss (recommended)
+        >>> loss_fn = create_uhved_loss(network_type='alex', use_perceptual=True)
 
-        >>> # With MONAI perceptual + SSIM
+        >>> # With VGG perceptual + SSIM
         >>> loss_fn = create_uhved_loss(
-        ...     backend='monai',
+        ...     network_type='vgg',
         ...     use_perceptual=True,
         ...     use_ssim=True,
         ...     ssim_weight=0.1
         ... )
     """
     return UHVEDLoss(
-        perceptual_backend=backend,
+        perceptual_network=network_type,
         use_perceptual=use_perceptual,
         use_ssim=use_ssim,
         **kwargs

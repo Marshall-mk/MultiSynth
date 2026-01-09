@@ -92,7 +92,6 @@ def pixel_shuffle_3d(x: torch.Tensor, upscale_factor: int) -> torch.Tensor:
 # Padding Utilities for Inference
 # =============================================================================
 
-
 def pad_to_multiple_of_32(
     volume: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -163,7 +162,6 @@ def unpad_volume(
 # =============================================================================
 # Model Statistics and Memory Profiling
 # =============================================================================
-
 
 def get_model_statistics(
     model: nn.Module,
@@ -451,7 +449,6 @@ def print_gpu_memory_stats(device: Optional[torch.device] = None, prefix: str = 
 # =============================================================================
 # Data Loading Utilities
 # =============================================================================
-
 
 def load_image_paths_from_csv(
     csv_path: Union[str, Path],
@@ -801,6 +798,7 @@ def save_model_checkpoint(filepath, model, optimizer, epoch, loss, val_loss=None
 
     torch.save(checkpoint, filepath)
 
+
 def save_training_config(model_dir, args, n_train_samples, n_val_samples, training_stage):
     """Save training configuration to JSON."""
     import json
@@ -847,7 +845,7 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
         'orientation_weight': args.orientation_weight,
         'use_perceptual': args.use_perceptual,
         'use_ssim': args.use_ssim,
-        'perceptual_backend': args.perceptual_backend,
+        'perceptual_network': args.perceptual_network,
 
         # Artifact probabilities
         'prob_motion': args.prob_motion,
@@ -880,6 +878,7 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
         json.dump(config, f, indent=2)
 
     print(f"Training configuration saved to: {config_path}")
+
 
 # =============================================================================
 # Evaluation Metrics
@@ -934,287 +933,6 @@ def calculate_metrics(pred: torch.Tensor, target: torch.Tensor, max_val: float =
             "r2": r2,
             "ssim": ssim,
         }
-
-
-def calculate_lpips_3d(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    backend: str = 'monai',
-    feature_layers: List[str] = None,
-    device: str = 'cuda'
-) -> float:
-    """
-    Calculate 3D-LPIPS (Learned Perceptual Image Patch Similarity) for volumetric data.
-
-    Uses proper 3D medical imaging networks instead of 2D slice-by-slice processing.
-    Leverages PerceptualLoss3D infrastructure with MedicalNet, MONAI, or Models Genesis.
-
-    Args:
-        pred: Predicted volume (B, C, D, H, W)
-        target: Target volume (B, C, D, H, W)
-        backend: 3D network backend ('medicalnet', 'monai', 'models_genesis')
-        feature_layers: Layers to extract features from
-        device: Device for computation
-
-    Returns:
-        3D-LPIPS score (lower is better, 0 = identical)
-
-    References:
-        - Zhang et al. "The Unreasonable Effectiveness of Deep Features as a Perceptual Metric"
-        - Adapted for 3D medical imaging volumes
-    """
-    try:
-        from src.losses import PerceptualLoss3D
-    except ImportError:
-        raise ImportError("PerceptualLoss3D not found in src.losses")
-
-    # Initialize 3D perceptual loss model (cached after first call)
-    cache_key = f'lpips_3d_{backend}'
-    if not hasattr(calculate_lpips_3d, cache_key):
-        if feature_layers is None:
-            feature_layers = ['layer1', 'layer2', 'layer3', 'layer4']
-
-        perceptual_loss = PerceptualLoss3D(
-            backend=backend,
-            model_depth=18,  # ResNet-18 for efficiency
-            feature_layers=feature_layers,
-            weights=[1.0] * len(feature_layers),
-            pretrained=False,  # We use random init for metric, not pre-trained
-            normalize_input=True,
-            freeze_backbone=False  # Allow gradient flow for feature extraction
-        ).to(device)
-        perceptual_loss.eval()
-        setattr(calculate_lpips_3d, cache_key, perceptual_loss)
-
-    perceptual_loss = getattr(calculate_lpips_3d, cache_key)
-
-    with torch.no_grad():
-        # Move to device
-        pred = pred.to(device)
-        target = target.to(device)
-
-        # Extract features from both volumes
-        pred_features = perceptual_loss.extract_features(pred)
-        target_features = perceptual_loss.extract_features(target)
-
-        # Compute L2 distance in feature space (LPIPS formula)
-        lpips_score = 0.0
-        num_layers = 0
-
-        for layer_name in feature_layers:
-            pred_feat = None
-            target_feat = None
-
-            # Find matching features
-            for name, feat in pred_features.items():
-                if layer_name in name:
-                    pred_feat = feat
-                    break
-
-            for name, feat in target_features.items():
-                if layer_name in name:
-                    target_feat = feat
-                    break
-
-            if pred_feat is not None and target_feat is not None:
-                # Spatial L2 normalization (LPIPS style)
-                diff = (pred_feat - target_feat) ** 2
-                # Average across spatial dimensions and channels
-                layer_dist = diff.mean(dim=[1, 2, 3, 4]).mean()
-                lpips_score += layer_dist.item()
-                num_layers += 1
-
-        # Average across layers
-        if num_layers > 0:
-            lpips_score /= num_layers
-
-    return lpips_score
-
-
-def calculate_rlpips(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    backend: str = 'monai',
-    adversarial_eps: float = 0.03,
-    device: str = 'cuda'
-) -> float:
-    """
-    Calculate R-LPIPS (Robust LPIPS) using adversarially trained features.
-
-    R-LPIPS was proposed to be robust against adversarial perturbations by using
-    features from adversarially trained networks instead of standard pre-trained ones.
-
-    Reference:
-        Ghazanfari et al. "R-LPIPS: An Adversarially Robust Perceptual Similarity Metric"
-        arXiv:2307.15157 (2023)
-        https://arxiv.org/abs/2307.15157
-
-    Args:
-        pred: Predicted volume (B, C, D, H, W)
-        target: Target volume (B, C, D, H, W)
-        backend: 3D network backend ('medicalnet', 'monai', 'models_genesis')
-        adversarial_eps: Epsilon for adversarial robustness (default: 0.03)
-        device: Device for computation
-
-    Returns:
-        R-LPIPS score (robust perceptual distance)
-
-    Note:
-        This implementation uses a simulated robust feature extractor.
-        For true R-LPIPS, networks should be adversarially trained (e.g., using PGD).
-        In medical imaging, adversarially trained 3D networks are rare, so this
-        provides an approximation using ensemble-based robustness.
-    """
-    try:
-        from src.losses import PerceptualLoss3D
-    except ImportError:
-        raise ImportError("PerceptualLoss3D not found in src.losses")
-
-    # Initialize robust perceptual loss model (cached after first call)
-    cache_key = f'rlpips_3d_{backend}'
-    if not hasattr(calculate_rlpips, cache_key):
-        feature_layers = ['layer1', 'layer2', 'layer3', 'layer4']
-
-        perceptual_loss = PerceptualLoss3D(
-            backend=backend,
-            model_depth=18,
-            feature_layers=feature_layers,
-            weights=[1.0] * len(feature_layers),
-            pretrained=False,
-            normalize_input=True,
-            freeze_backbone=False
-        ).to(device)
-        perceptual_loss.eval()
-        setattr(calculate_rlpips, cache_key, perceptual_loss)
-
-    perceptual_loss = getattr(calculate_rlpips, cache_key)
-
-    with torch.no_grad():
-        # Move to device
-        pred = pred.to(device)
-        target = target.to(device)
-
-        # R-LPIPS: Ensemble-based robustness approximation
-        # Since we don't have access to adversarially trained 3D medical networks,
-        # we use an ensemble of perturbations to simulate robustness
-        # This is inspired by the E-LPIPS (Ensemble LPIPS) approach
-
-        # Base features
-        pred_features_base = perceptual_loss.extract_features(pred)
-        target_features_base = perceptual_loss.extract_features(target)
-
-        # Add small random perturbations to simulate adversarial robustness
-        num_perturbations = 3
-        all_scores = []
-
-        for i in range(num_perturbations):
-            # Random perturbation within epsilon
-            if i == 0:
-                # Use original (no perturbation)
-                pred_pert = pred
-                target_pert = target
-            else:
-                # Add small Gaussian noise (simulating adversarial robustness)
-                noise_scale = adversarial_eps * (i / num_perturbations)
-                pred_noise = torch.randn_like(pred) * noise_scale
-                target_noise = torch.randn_like(target) * noise_scale
-
-                pred_pert = torch.clamp(pred + pred_noise, 0, 1)
-                target_pert = torch.clamp(target + target_noise, 0, 1)
-
-            # Extract features with perturbation
-            pred_features = perceptual_loss.extract_features(pred_pert)
-            target_features = perceptual_loss.extract_features(target_pert)
-
-            # Compute perceptual distance
-            score = 0.0
-            num_layers = 0
-
-            for layer_name in perceptual_loss.feature_layers:
-                pred_feat = None
-                target_feat = None
-
-                for name, feat in pred_features.items():
-                    if layer_name in name:
-                        pred_feat = feat
-                        break
-
-                for name, feat in target_features.items():
-                    if layer_name in name:
-                        target_feat = feat
-                        break
-
-                if pred_feat is not None and target_feat is not None:
-                    diff = (pred_feat - target_feat) ** 2
-                    layer_dist = diff.mean(dim=[1, 2, 3, 4]).mean()
-                    score += layer_dist.item()
-                    num_layers += 1
-
-            if num_layers > 0:
-                score /= num_layers
-
-            all_scores.append(score)
-
-        # R-LPIPS: Robust estimate using median of ensemble
-        # (median is more robust to outliers than mean)
-        rlpips_score = float(np.median(all_scores))
-
-    return rlpips_score
-
-
-def calculate_metrics_with_lpips(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    max_val: float = 1.0,
-    compute_lpips: bool = True,
-    lpips_backend: str = 'monai',
-    device: str = 'cuda'
-):
-    """
-    Calculate comprehensive evaluation metrics including 3D-LPIPS and R-LPIPS.
-
-    Args:
-        pred: Predicted volumes (B, C, D, H, W)
-        target: Target volumes (B, C, D, H, W)
-        max_val: Maximum pixel value for PSNR calculation (default: 1.0)
-        compute_lpips: Whether to compute LPIPS metrics
-        lpips_backend: 3D network backend ('monai', 'medicalnet', 'models_genesis')
-        device: Device for computation
-
-    Returns:
-        Dictionary of metrics including standard metrics, 3D-LPIPS, and R-LPIPS
-
-    References:
-        - Zhang et al. "The Unreasonable Effectiveness of Deep Features as a Perceptual Metric" (CVPR 2018)
-        - Ghazanfari et al. "R-LPIPS: An Adversarially Robust Perceptual Similarity Metric" (arXiv 2023)
-    """
-    # Get standard metrics
-    metrics = calculate_metrics(pred, target, max_val=max_val)
-
-    # Add 3D-LPIPS and R-LPIPS metrics if requested
-    if compute_lpips:
-        try:
-            with torch.no_grad():
-                # 3D-LPIPS using proper 3D encoder
-                lpips_3d = calculate_lpips_3d(
-                    pred, target, backend=lpips_backend, device=device
-                )
-                metrics['lpips_3d'] = lpips_3d
-
-                # R-LPIPS (Robust LPIPS)
-                rlpips = calculate_rlpips(
-                    pred, target, backend=lpips_backend, device=device
-                )
-                metrics['rlpips'] = rlpips
-
-        except ImportError as e:
-            import warnings
-            warnings.warn(f"3D-LPIPS calculation skipped: {str(e)}")
-        except Exception as e:
-            import warnings
-            warnings.warn(f"Error computing 3D-LPIPS: {str(e)}")
-
-    return metrics
 
 
 # =============================================================================

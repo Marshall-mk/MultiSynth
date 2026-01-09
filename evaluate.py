@@ -15,12 +15,11 @@ Directory Structure:
     └── ...
 
 Usage:
-    python calc_metrics.py \\
+    python evaluate.py \\
         --test_dir /path/to/test \\
         --prediction_name model1_sr.nii.gz \\
         --output_csv results.csv \\
-        --output_json results.json \\
-        --compute_lpips
+        --output_json results.json
 """
 
 import os
@@ -37,7 +36,7 @@ import nibabel as nib
 from tqdm import tqdm
 
 # Import metrics from project
-from src.utils import calculate_metrics_with_lpips
+from src.utils import calculate_metrics
 
 
 def load_nifti_volume(file_path: str) -> np.ndarray:
@@ -100,8 +99,6 @@ def find_subject_pairs(test_dir: str, prediction_name: str, gt_name: str = "HR_g
 def compute_metrics_for_pair(
     gt_path: str,
     pred_path: str,
-    compute_lpips: bool = True,
-    lpips_backend: str = 'monai',
     device: str = 'cuda'
 ) -> Dict[str, float]:
     """
@@ -110,12 +107,10 @@ def compute_metrics_for_pair(
     Args:
         gt_path: Path to ground truth NIfTI file
         pred_path: Path to prediction NIfTI file
-        compute_lpips: Whether to compute LPIPS metrics
-        lpips_backend: Backend for LPIPS computation
-        device: Device for computation
+        device: Device for computation (not used in standard metrics)
 
     Returns:
-        Dictionary of metrics
+        Dictionary of metrics (MAE, MSE, RMSE, PSNR, R², SSIM)
     """
     # Load volumes
     gt_volume = load_nifti_volume(gt_path)
@@ -132,13 +127,10 @@ def compute_metrics_for_pair(
     pred_tensor = torch.from_numpy(pred_volume).float().unsqueeze(0).unsqueeze(0)
 
     # Compute metrics
-    metrics = calculate_metrics_with_lpips(
+    metrics = calculate_metrics(
         pred_tensor,
         gt_tensor,
-        max_val=1.0,
-        compute_lpips=compute_lpips,
-        lpips_backend=lpips_backend,
-        device=device
+        max_val=1.0
     )
 
     return metrics
@@ -321,13 +313,6 @@ Examples:
     parser.add_argument('--device', type=str, default='cuda',
                         choices=['cuda', 'cpu'],
                         help='Device to use for computation')
-    parser.add_argument('--compute_lpips', action='store_true', default=True,
-                        help='Compute LPIPS metrics (default: True)')
-    parser.add_argument('--no_lpips', dest='compute_lpips', action='store_false',
-                        help='Disable LPIPS metrics computation')
-    parser.add_argument('--lpips_backend', type=str, default='monai',
-                        choices=['monai', 'medicalnet', 'models_genesis'],
-                        help='Backend for LPIPS computation (default: monai)')
 
     # Output control
     parser.add_argument('--verbose', action='store_true',
@@ -374,8 +359,6 @@ def main():
             metrics = compute_metrics_for_pair(
                 gt_path=gt_path,
                 pred_path=pred_path,
-                compute_lpips=args.compute_lpips,
-                lpips_backend=args.lpips_backend,
                 device=args.device
             )
 

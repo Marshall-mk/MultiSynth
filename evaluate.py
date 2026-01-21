@@ -96,45 +96,132 @@ def find_subject_pairs(test_dir: str, prediction_name: str, gt_name: str = "HR_g
     return pairs
 
 
+def center_crop_to_match(volume1: np.ndarray, volume2: np.ndarray) -> tuple:
+    """
+    Center crop both volumes to their minimum overlapping size.
+
+    Args:
+        volume1: First volume (e.g., ground truth)
+        volume2: Second volume (e.g., prediction)
+
+    Returns:
+        Tuple of (cropped_volume1, cropped_volume2)
+    """
+    shape1 = np.array(volume1.shape)
+    shape2 = np.array(volume2.shape)
+
+    # Determine minimum shape along each dimension
+    min_shape = np.minimum(shape1, shape2)
+
+    # Calculate crop indices for volume1
+    start1 = (shape1 - min_shape) // 2
+    end1 = start1 + min_shape
+
+    # Calculate crop indices for volume2
+    start2 = (shape2 - min_shape) // 2
+    end2 = start2 + min_shape
+
+    # Perform center crop
+    cropped1 = volume1[start1[0]:end1[0], start1[1]:end1[1], start1[2]:end1[2]]
+    cropped2 = volume2[start2[0]:end2[0], start2[1]:end2[1], start2[2]:end2[2]]
+
+    return cropped1, cropped2
+
+
 def compute_metrics_for_pair(
     gt_path: str,
     pred_path: str,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    disable_intensity_filter: bool = False,
+    eval_thr_hi: float = 0.2,
+    eval_thr_lo: float = 0.1,
+    center_keep_radius: float = 0.45,
+    min_eval_voxels: int = 1000,
+    use_perceptual: bool = False,
+    perceptual_network: str = 'alex',
+    is_fake_3d: bool = True
 ) -> Dict[str, float]:
-    """
-    Compute metrics between ground truth and prediction.
 
-    Args:
-        gt_path: Path to ground truth NIfTI file
-        pred_path: Path to prediction NIfTI file
-        device: Device for computation (not used in standard metrics)
-
-    Returns:
-        Dictionary of metrics (MAE, MSE, RMSE, PSNR, R², SSIM)
-    """
-    # Load volumes
     gt_volume = load_nifti_volume(gt_path)
     pred_volume = load_nifti_volume(pred_path)
 
-    # Validate shapes match
     if gt_volume.shape != pred_volume.shape:
-        raise ValueError(
-            f"Shape mismatch: GT {gt_volume.shape} vs Pred {pred_volume.shape}"
+        logging.warning(
+            f"Shape mismatch detected: GT {gt_volume.shape} vs Pred {pred_volume.shape}. "
+            f"Applying center crop to minimum size."
+        )
+        gt_volume, pred_volume = center_crop_to_match(gt_volume, pred_volume)
+        logging.info(f"Cropped to common shape: {gt_volume.shape}")
+
+    # Build center-aware eval mask (or use all voxels if filtering is disabled)
+    if disable_intensity_filter:
+        # Evaluate all voxels when filtering is disabled
+        eval_mask = np.ones(pred_volume.shape, dtype=bool)
+        num_vox = int(np.prod(pred_volume.shape))
+    else:
+        # Build center-aware eval mask:
+        # - always keep pred > hi
+        # - also keep pred in (lo, hi] if inside the central ellipsoid
+        center_mask = central_ellipsoid_mask(pred_volume.shape, radius_frac=center_keep_radius)
+
+        eval_mask = (pred_volume > eval_thr_hi) | (
+            (pred_volume > eval_thr_lo) & (pred_volume <= eval_thr_hi) & center_mask
         )
 
-    # Convert to tensors with batch and channel dimensions
-    gt_tensor = torch.from_numpy(gt_volume).float().unsqueeze(0).unsqueeze(0)
-    pred_tensor = torch.from_numpy(pred_volume).float().unsqueeze(0).unsqueeze(0)
+        num_vox = int(np.count_nonzero(eval_mask))
+        if num_vox < min_eval_voxels:
+            raise RuntimeError(
+                f"Too few voxels to evaluate after masking: {num_vox} < {min_eval_voxels}. "
+                f"(hi={eval_thr_hi}, lo={eval_thr_lo}, center_radius={center_keep_radius})"
+            )
 
-    # Compute metrics
+    # Zero-out outside-mask voxels in BOTH volumes (keeps tensor shapes for SSIM, etc.)
+    gt_volume_f = gt_volume.copy()
+    pred_volume_f = pred_volume.copy()
+    gt_volume_f[~eval_mask] = 0.0
+    pred_volume_f[~eval_mask] = 0.0
+
+    gt_tensor = torch.from_numpy(gt_volume_f).float().unsqueeze(0).unsqueeze(0)
+    pred_tensor = torch.from_numpy(pred_volume_f).float().unsqueeze(0).unsqueeze(0)
+
     metrics = calculate_metrics(
         pred_tensor,
         gt_tensor,
-        max_val=1.0
+        max_val=1.0,
+        use_perceptual=use_perceptual,
+        perceptual_network=perceptual_network,
+        is_fake_3d=is_fake_3d
     )
+    metrics["eval_voxels"] = float(num_vox)
+    metrics["intensity_filter_disabled"] = bool(disable_intensity_filter)
+    if not disable_intensity_filter:
+        metrics["eval_thr_hi"] = float(eval_thr_hi)
+        metrics["eval_thr_lo"] = float(eval_thr_lo)
+        metrics["center_keep_radius"] = float(center_keep_radius)
 
     return metrics
 
+
+def central_ellipsoid_mask(shape: tuple, radius_frac: float = 0.45) -> np.ndarray:
+    """
+    Create a central ellipsoid mask.
+    radius_frac is relative to half-size along each axis.
+      - 1.0 means it reaches the borders
+      - 0.5 means half of the half-size (i.e., quarter of full size)
+    """
+    assert len(shape) == 3
+    cx, cy, cz = (np.array(shape) - 1) / 2.0
+    rx, ry, rz = (np.array(shape) / 2.0) * float(radius_frac)
+
+    # Avoid division by zero
+    rx = max(rx, 1e-6); ry = max(ry, 1e-6); rz = max(rz, 1e-6)
+
+    x = np.arange(shape[0])[:, None, None]
+    y = np.arange(shape[1])[None, :, None]
+    z = np.arange(shape[2])[None, None, :]
+
+    ell = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 + ((z - cz) / rz) ** 2 <= 1.0
+    return ell
 
 def aggregate_metrics(volume_results: List[Dict[str, float]]) -> Dict[str, Dict[str, float]]:
     """
@@ -282,18 +369,12 @@ def parse_arguments():
         epilog="""
 Examples:
   # Evaluate model predictions
-  python calc_metrics.py \\
+  python evaluate.py \\
     --test_dir /data/test \\
     --prediction_name model1_sr.nii.gz \\
     --output_csv model1_metrics.csv \\
     --output_json model1_metrics.json
 
-  # Evaluate without LPIPS metrics
-  python calc_metrics.py \\
-    --test_dir /data/test \\
-    --prediction_name model2_output.nii.gz \\
-    --output_csv model2_metrics.csv \\
-    --no_lpips
 """
     )
 
@@ -308,6 +389,27 @@ Examples:
                         help='Path to save CSV results')
     parser.add_argument('--output_json', type=str,
                         help='Path to save JSON results (optional)')
+    # Center-aware artifact filtering
+    parser.add_argument('--disable_intensity_filter', action='store_true',
+                        help='Disable intensity-based filtering and evaluate all voxels (default: False)')
+    parser.add_argument('--eval_thr_hi', type=float, default=0.25,
+                        help='Primary threshold: always evaluate voxels where pred > eval_thr_hi (default 0.25)')
+    parser.add_argument('--eval_thr_lo', type=float, default=0.15,
+                        help='Secondary threshold: evaluate voxels where pred > eval_thr_lo AND inside center region (default 0.15)')
+    parser.add_argument('--center_keep_radius', type=float, default=0.35,
+                        help=("Keep low-intensity voxels within a central ellipsoid. "
+                              "Value is fraction of half-size per axis (0-1). Default 0.35"))
+    parser.add_argument('--min_eval_voxels', type=int, default=1000,
+                        help='Skip a volume if fewer than this many voxels are evaluated (default 1000)')
+
+    # Perceptual loss arguments
+    parser.add_argument('--use_perceptual', action='store_true',
+                        help='Compute MONAI perceptual loss metric')
+    parser.add_argument('--perceptual_network', type=str, default='alex',
+                        choices=['alex', 'vgg', 'squeeze', 'radimagenet', 'medicalnet', 'resnet50'],
+                        help='Network backbone for perceptual loss (default: alex)')
+    parser.add_argument('--perceptual_fake_3d', action='store_true', default=True,
+                        help='Use 2.5D slice-based processing for perceptual loss (default: True, faster)')
 
     # Computation arguments
     parser.add_argument('--device', type=str, default='cuda',
@@ -338,7 +440,6 @@ def main():
     logging.info(f"Prediction name: {args.prediction_name}")
     logging.info(f"Ground truth name: {args.gt_name}")
     logging.info(f"Device: {args.device}")
-    logging.info(f"Compute LPIPS: {args.compute_lpips}")
 
     # Find all subject pairs
     logging.info("\nSearching for subject pairs...")
@@ -357,10 +458,19 @@ def main():
     for subject_id, gt_path, pred_path in tqdm(subject_pairs, desc="Computing metrics"):
         try:
             metrics = compute_metrics_for_pair(
-                gt_path=gt_path,
-                pred_path=pred_path,
-                device=args.device
-            )
+                        gt_path=gt_path,
+                        pred_path=pred_path,
+                        device=args.device,
+                        disable_intensity_filter=args.disable_intensity_filter,
+                        eval_thr_hi=args.eval_thr_hi,
+                        eval_thr_lo=args.eval_thr_lo,
+                        center_keep_radius=args.center_keep_radius,
+                        min_eval_voxels=args.min_eval_voxels,
+                        use_perceptual=args.use_perceptual,
+                        perceptual_network=args.perceptual_network,
+                        is_fake_3d=args.perceptual_fake_3d
+                    )
+
 
             volume_results.append(metrics)
             subject_ids.append(subject_id)
@@ -398,9 +508,14 @@ def main():
             'prediction_name': args.prediction_name,
             'gt_name': args.gt_name,
             'num_volumes': len(volume_results),
-            'compute_lpips': args.compute_lpips,
-            'lpips_backend': args.lpips_backend if args.compute_lpips else None,
-            'device': args.device
+            'device': args.device,
+            'intensity_filter_disabled': args.disable_intensity_filter,
+            'eval_thr_hi': args.eval_thr_hi if not args.disable_intensity_filter else None,
+            'eval_thr_lo': args.eval_thr_lo if not args.disable_intensity_filter else None,
+            'center_keep_radius': args.center_keep_radius if not args.disable_intensity_filter else None,
+            'use_perceptual': args.use_perceptual,
+            'perceptual_network': args.perceptual_network if args.use_perceptual else None,
+            'perceptual_fake_3d': args.perceptual_fake_3d if args.use_perceptual else None
         }
         save_json_results(
             volume_results=volume_results,

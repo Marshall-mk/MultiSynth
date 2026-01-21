@@ -9,9 +9,10 @@ import numpy as np
 import os
 import glob
 import pandas as pd
+import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
-from monai.losses import SSIMLoss as MonaiSSIM
+from monai.losses import SSIMLoss as MonaiSSIM, PerceptualLoss
 
 
 class PixelShuffle3d(nn.Module):
@@ -884,7 +885,14 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
 # Evaluation Metrics
 # =============================================================================
 
-def calculate_metrics(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0):
+def calculate_metrics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    max_val: float = 1.0,
+    use_perceptual: bool = False,
+    perceptual_network: str = 'alex',
+    is_fake_3d: bool = True
+):
     """
     Calculate evaluation metrics.
 
@@ -892,6 +900,9 @@ def calculate_metrics(pred: torch.Tensor, target: torch.Tensor, max_val: float =
         pred: Predicted images (B, C, D, H, W)
         target: Target images (B, C, D, H, W)
         max_val: Maximum pixel value for PSNR calculation (default: 1.0)
+        use_perceptual: Whether to compute MONAI perceptual loss metric
+        perceptual_network: Network backbone for perceptual loss
+        is_fake_3d: Use 2.5D slice-based processing for perceptual loss
 
     Returns:
         Dictionary of metrics
@@ -925,7 +936,25 @@ def calculate_metrics(pred: torch.Tensor, target: torch.Tensor, max_val: float =
         ssim_loss = ssim_loss_fn(pred, target).item()
         ssim = 1 - ssim_loss  # Convert from loss to similarity
 
-        return {
+        # Perceptual loss (optional)
+        if use_perceptual:
+            try:
+                perceptual_fn = PerceptualLoss(
+                    spatial_dims=3,
+                    network_type=perceptual_network,
+                    is_fake_3d=is_fake_3d,
+                    pretrained=True
+                )
+                perceptual_fn.to(pred.device)
+                perceptual_loss = perceptual_fn(pred, target).item()
+            except Exception as e:
+                warnings.warn(f"Perceptual loss computation failed: {e}")
+                perceptual_loss = float('nan')
+        else:
+            perceptual_loss = None
+
+        # Build metrics dictionary
+        metrics = {
             "mae": mae,
             "mse": mse,
             "rmse": rmse,
@@ -933,6 +962,12 @@ def calculate_metrics(pred: torch.Tensor, target: torch.Tensor, max_val: float =
             "r2": r2,
             "ssim": ssim,
         }
+
+        # Add perceptual loss if computed
+        if perceptual_loss is not None:
+            metrics["perceptual_loss"] = perceptual_loss
+
+        return metrics
 
 
 # =============================================================================

@@ -57,7 +57,8 @@ class UHVED(nn.Module):
         share_encoder: bool = False,
         share_decoder: bool = False,
         use_prior: bool = True,
-        use_encoder_outputs_as_skip: bool = True,
+        use_encoder_outputs_as_skip: bool = False,
+        use_instance_norm: bool = True,
         activation: str = 'leakyrelu',
         upsample_mode: str = 'trilinear',
         reconstruct_orientations: bool = True,
@@ -93,6 +94,7 @@ class UHVED(nn.Module):
             base_channels=base_channels,
             num_scales=num_scales,
             share_weights=share_encoder,
+            use_instance_norm=use_instance_norm,
             activation=activation
         )
 
@@ -111,6 +113,7 @@ class UHVED(nn.Module):
                 num_scales=num_scales,
                 upsample_mode=upsample_mode,
                 activation=activation,
+                use_instance_norm=use_instance_norm,
                 share_decoder=share_decoder,
                 final_activation=final_activation
             )
@@ -120,6 +123,7 @@ class UHVED(nn.Module):
                 base_channels=base_channels,
                 num_scales=num_scales,
                 upsample_mode=upsample_mode,
+                use_instance_norm=use_instance_norm,
                 activation=activation,
                 final_activation=final_activation
             )
@@ -259,7 +263,8 @@ class UHVEDLite(nn.Module):
         in_channels: int = 1,
         out_channels: int = 1,
         base_channels: int = 16,
-        num_scales: int = 3
+        num_scales: int = 3,
+        use_instance_norm: bool = True
     ):
         super().__init__()
 
@@ -269,6 +274,7 @@ class UHVEDLite(nn.Module):
         self.encoder = ConvEncoder(
             in_channels=in_channels,
             base_channels=base_channels,
+            use_instance_norm=use_instance_norm,
             num_scales=num_scales
         )
 
@@ -279,6 +285,7 @@ class UHVEDLite(nn.Module):
         self.decoder = ConvDecoder(
             out_channels=out_channels,
             base_channels=base_channels,
+            use_instance_norm=use_instance_norm,
             num_scales=num_scales
         )
 
@@ -340,6 +347,7 @@ class UHVEDWithUpscale(nn.Module):
         base_channels: int = 32,
         num_scales: int = 4,
         upscale_factor: int = 4,
+        use_instance_norm: bool = True,
         final_activation: str = 'sigmoid'
     ):
         """
@@ -364,6 +372,7 @@ class UHVEDWithUpscale(nn.Module):
             out_channels=base_channels,  # Output features, not final image
             base_channels=base_channels,
             num_scales=num_scales,
+            use_instance_norm=use_instance_norm,
             reconstruct_orientations=False
         )
 

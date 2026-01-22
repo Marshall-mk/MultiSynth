@@ -824,8 +824,9 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
         'base_channels': args.base_channels,
         'num_scales': args.num_scales,
         'final_activation': args.final_activation,
-        'use_prior': args.use_prior,
-        'use_encoder_outputs_as_skip': args.use_encoder_outputs_as_skip,
+        'use_prior': True,
+        'use_encoder_outputs_as_skip': False,
+        'use_instance_norm': not args.no_instance_norm,
         'decoder_upsample_mode': args.decoder_upsample_mode,
 
         # Output configuration

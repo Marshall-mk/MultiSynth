@@ -25,6 +25,7 @@ class ResidualBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         kernel_size: int = 3,
+        use_instance_norm: bool = True,
         activation: str = 'leakyrelu'
     ):
         super().__init__()
@@ -34,8 +35,8 @@ class ResidualBlock(nn.Module):
         self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size, 1, padding)
         self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size, 1, padding)
 
-        self.norm1 = nn.InstanceNorm3d(out_channels)
-        self.norm2 = nn.InstanceNorm3d(out_channels)
+        self.norm1 = nn.InstanceNorm3d(out_channels) if use_instance_norm else nn.Identity()
+        self.norm2 = nn.InstanceNorm3d(out_channels) if use_instance_norm else nn.Identity()
 
         if activation == 'leakyrelu':
             self.activation = nn.LeakyReLU(0.2, inplace=True)
@@ -80,6 +81,7 @@ class UpsampleBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         scale_factor: int = 2,
+        use_instance_norm: bool = True,
         mode: str = 'trilinear'
     ):
         """
@@ -110,7 +112,7 @@ class UpsampleBlock(nn.Module):
         else:
             raise ValueError(f"Unknown upsample mode: {mode}")
 
-        self.norm = nn.InstanceNorm3d(out_channels)
+        self.norm = nn.InstanceNorm3d(out_channels) if use_instance_norm else nn.Identity()
         self.activation = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -138,6 +140,7 @@ class DecoderBlock(nn.Module):
         out_channels: int,
         num_residual_blocks: int = 2,
         upsample_mode: str = 'bilinear',
+        use_instance_norm: bool = True,
         activation: str = 'leakyrelu'
     ):
         """
@@ -152,16 +155,16 @@ class DecoderBlock(nn.Module):
         super().__init__()
 
         # Upsampling
-        self.upsample = UpsampleBlock(in_channels, in_channels, mode=upsample_mode)
+        self.upsample = UpsampleBlock(in_channels, in_channels, use_instance_norm=use_instance_norm, mode=upsample_mode)
 
         # Skip connection fusion
         # Concatenate upsampled features with skip connection
         fused_channels = in_channels + skip_channels
 
         # Residual blocks
-        layers = [ResidualBlock(fused_channels, out_channels, activation=activation)]
+        layers = [ResidualBlock(fused_channels, out_channels, activation=activation, use_instance_norm=use_instance_norm)]
         for _ in range(num_residual_blocks - 1):
-            layers.append(ResidualBlock(out_channels, out_channels, activation=activation))
+            layers.append(ResidualBlock(out_channels, out_channels, activation=activation, use_instance_norm=use_instance_norm))
 
         self.blocks = nn.Sequential(*layers)
 
@@ -204,6 +207,7 @@ class ConvDecoder(nn.Module):
         base_channels: int = 32,
         num_scales: int = 4,
         upsample_mode: str = 'bilinear',
+        use_instance_norm: bool = True,
         activation: str = 'leakyrelu',
         final_activation: str = 'tanh'
     ):
@@ -237,14 +241,15 @@ class ConvDecoder(nn.Module):
                     skip_channels=skip_ch,
                     out_channels=out_ch,
                     upsample_mode=upsample_mode,
-                    activation=activation
+                    activation=activation,
+                    use_instance_norm=use_instance_norm
                 )
             )
 
         # Final output layer
         self.final_conv = nn.Sequential(
             nn.Conv3d(base_channels, base_channels, 3, 1, 1),
-            nn.InstanceNorm3d(base_channels),
+            nn.InstanceNorm3d(base_channels) if use_instance_norm else nn.Identity(),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv3d(base_channels, out_channels, 3, 1, 1)
         )
@@ -313,6 +318,7 @@ class MultiOutputDecoder(nn.Module):
         num_scales: int = 4,
         upsample_mode: str = 'bilinear',
         activation: str = 'leakyrelu',
+        use_instance_norm: bool = True,
         share_decoder: bool = False,
         final_activation: str = 'sigmoid'
     ):
@@ -338,6 +344,7 @@ class MultiOutputDecoder(nn.Module):
             base_channels=base_channels,
             num_scales=num_scales,
             upsample_mode=upsample_mode,
+            use_instance_norm=use_instance_norm,
             activation=activation,
             final_activation=final_activation
         )
@@ -349,6 +356,7 @@ class MultiOutputDecoder(nn.Module):
                 base_channels=base_channels,
                 num_scales=num_scales,
                 upsample_mode=upsample_mode,
+                use_instance_norm=use_instance_norm,
                 activation=activation,
                 final_activation=final_activation
             )
@@ -359,6 +367,7 @@ class MultiOutputDecoder(nn.Module):
                     base_channels=base_channels,
                     num_scales=num_scales,
                     upsample_mode=upsample_mode,
+                    use_instance_norm=use_instance_norm,
                     activation=activation,
                     final_activation=final_activation
                 )

@@ -114,6 +114,7 @@ def load_uhved_from_checkpoint(checkpoint_path, device="cuda"):
     reconstruct_orientations = model_config.get('reconstruct_orientations', True)
     use_prior = model_config.get('use_prior', True)
     use_encoder_outputs_as_skip = model_config.get('use_encoder_outputs_as_skip', False)
+    use_instance_norm = model_config.get('use_instance_norm', True)
     decoder_upsample_mode = model_config.get('decoder_upsample_mode', 'trilinear')
     final_activation = model_config.get('final_activation', 'sigmoid')
     share_encoder = model_config.get('share_encoder', False)
@@ -129,6 +130,7 @@ def load_uhved_from_checkpoint(checkpoint_path, device="cuda"):
     print(f"  - reconstruct_orientations: {reconstruct_orientations}")
     print(f"  - use_prior: {use_prior}")
     print(f"  - use_encoder_outputs_as_skip: {use_encoder_outputs_as_skip}")
+    print(f"  - use_instance_norm: {use_instance_norm}")
     print(f"  - decoder_upsample_mode: {decoder_upsample_mode}")
     print(f"  - final_activation: {final_activation}")
 
@@ -143,6 +145,7 @@ def load_uhved_from_checkpoint(checkpoint_path, device="cuda"):
         share_decoder=share_decoder,
         use_prior=use_prior,
         use_encoder_outputs_as_skip=use_encoder_outputs_as_skip,
+        use_instance_norm=use_instance_norm,
         activation=activation,
         upsample_mode=decoder_upsample_mode,
         reconstruct_orientations=reconstruct_orientations,

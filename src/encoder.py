@@ -73,17 +73,18 @@ class EncoderBlock(nn.Module):
         hidden_channels: int,
         num_residual_blocks: int = 2,
         downsample: bool = True,
+        use_instance_norm: bool = True,
         activation: str = 'leakyrelu'
     ):
         super().__init__()
 
         # First residual block handles channel change and optional downsampling
         stride = 2 if downsample else 1
-        layers = [ResidualBlock(in_channels, hidden_channels, stride=stride, activation=activation)]
+        layers = [ResidualBlock(in_channels, hidden_channels, stride=stride, activation=activation, use_instance_norm=use_instance_norm)]
 
         # Additional residual blocks
         for _ in range(num_residual_blocks - 1):
-            layers.append(ResidualBlock(hidden_channels, hidden_channels, activation=activation))
+            layers.append(ResidualBlock(hidden_channels, hidden_channels, activation=activation, use_instance_norm=use_instance_norm))
 
         self.blocks = nn.Sequential(*layers)
 
@@ -131,7 +132,8 @@ class ConvEncoder(nn.Module):
         in_channels: int = 1,
         base_channels: int = 32,
         num_scales: int = 4,
-        activation: str = 'leakyrelu'
+        activation: str = 'leakyrelu',
+        use_instance_norm: bool = True,
     ):
         """
         Args:
@@ -139,6 +141,7 @@ class ConvEncoder(nn.Module):
             base_channels: Base number of channels (doubles at each scale)
             num_scales: Number of encoding scales (default 4)
             activation: Activation function type
+            use_instance_norm: Whether to use instance normalization
         """
         super().__init__()
 
@@ -146,7 +149,7 @@ class ConvEncoder(nn.Module):
 
         # Initial projection
         self.initial_conv = nn.Conv3d(in_channels, base_channels, kernel_size=3, padding=1)
-        self.initial_norm = nn.InstanceNorm3d(base_channels)
+        self.initial_norm = nn.InstanceNorm3d(base_channels) if use_instance_norm else nn.Identity()
         self.initial_act = nn.LeakyReLU(0.2, inplace=True) if activation == 'leakyrelu' else nn.ReLU(inplace=True)
 
         # Encoder blocks at each scale
@@ -162,6 +165,7 @@ class ConvEncoder(nn.Module):
                     in_channels=in_ch,
                     hidden_channels=out_ch,
                     downsample=downsample,
+                    use_instance_norm=use_instance_norm,
                     activation=activation
                 )
             )
@@ -218,6 +222,7 @@ class MultiModalEncoder(nn.Module):
         base_channels: int = 32,
         num_scales: int = 4,
         share_weights: bool = False,
+        use_instance_norm: bool = True,
         activation: str = 'leakyrelu'
     ):
         """
@@ -237,12 +242,12 @@ class MultiModalEncoder(nn.Module):
 
         if share_weights:
             # Single shared encoder
-            self.encoder = ConvEncoder(in_channels, base_channels, num_scales, activation)
+            self.encoder = ConvEncoder(in_channels, base_channels, num_scales, activation, use_instance_norm=use_instance_norm)
             self.hidden_dims = self.encoder.hidden_dims
         else:
             # Independent encoder per orientation
             self.encoders = nn.ModuleList([
-                ConvEncoder(in_channels, base_channels, num_scales, activation)
+                ConvEncoder(in_channels, base_channels, num_scales, activation, use_instance_norm=use_instance_norm)
                 for _ in range(num_orientations)
             ])
             self.hidden_dims = self.encoders[0].hidden_dims

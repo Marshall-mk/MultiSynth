@@ -18,3 +18,4 @@ scipy
 matplotlib
 streamlit
 rich
+hd-bet

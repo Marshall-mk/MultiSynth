@@ -96,8 +96,7 @@ def train_uhved_model(
     use_sliding_window_val: bool = False,
     val_patch_size: tuple = (128, 128, 128),
     val_overlap: float = 0.5,
-    use_prior: bool = False,
-    use_encoder_outputs_as_skip: bool = False,
+    use_instance_norm: bool = True,
     reconstruct_orientations: bool = True,
     final_activation: str = "sigmoid",
     max_grad_norm: float = 1.0,
@@ -158,8 +157,7 @@ def train_uhved_model(
         use_sliding_window_val: Use sliding window inference for validation
         val_patch_size: Patch size for sliding window validation
         val_overlap: Overlap ratio for sliding window validation
-        use_prior: Whether to use prior in U-HVED model
-        use_encoder_outputs_as_skip: Whether to use encoder features as skip connections
+        use_instance_norm: Whether to use instance normalization
         final_activation: Final activation function ('tanh', 'sigmoid', or 'none')
         max_grad_norm: Maximum gradient norm for clipping (0 to disable)
         decoder_upsample_mode: Decoder upsampling strategy ('trilinear', 'transpose', or 'pixelshuffle')
@@ -339,9 +337,10 @@ def train_uhved_model(
         num_scales=num_scales,
         share_encoder=False,  # Independent encoders for each orientation
         share_decoder=False,
-        use_prior=use_prior,
-        use_encoder_outputs_as_skip=use_encoder_outputs_as_skip,  # Use encoder features as skip connections
+        use_prior=True,
+        use_encoder_outputs_as_skip=False,  # Use encoder features as skip connections
         reconstruct_orientations=reconstruct_orientations,  # Control orientation reconstruction for ablations
+        use_instance_norm=use_instance_norm,
         final_activation=final_activation,
         upsample_mode=decoder_upsample_mode,
     )
@@ -748,8 +747,9 @@ def train_uhved_model(
                     "num_scales": num_scales,
                     "output_shape": output_shape,
                     "reconstruct_orientations": reconstruct_orientations,
-                    "use_prior": use_prior,
-                    "use_encoder_outputs_as_skip": use_encoder_outputs_as_skip,
+                    "use_prior": True,
+                    "use_encoder_outputs_as_skip": False,
+                    "use_instance_norm": use_instance_norm,
                     "decoder_upsample_mode": decoder_upsample_mode,
                     "final_activation": final_activation,
                     "share_encoder": False,
@@ -802,8 +802,9 @@ def train_uhved_model(
                     "num_scales": num_scales,
                     "output_shape": output_shape,
                     "reconstruct_orientations": reconstruct_orientations,
-                    "use_prior": use_prior,
-                    "use_encoder_outputs_as_skip": use_encoder_outputs_as_skip,
+                    "use_prior": True,
+                    "use_encoder_outputs_as_skip": False,
+                    "use_instance_norm": use_instance_norm,
                     "decoder_upsample_mode": decoder_upsample_mode,
                     "final_activation": final_activation,
                     "share_encoder": False,
@@ -856,8 +857,9 @@ def train_uhved_model(
             "num_scales": num_scales,
             "output_shape": output_shape,
             "reconstruct_orientations": reconstruct_orientations,
-            "use_prior": use_prior,
-            "use_encoder_outputs_as_skip": use_encoder_outputs_as_skip,
+            "use_prior": True,
+            "use_encoder_outputs_as_skip": False,
+            "use_instance_norm": use_instance_norm,
             "decoder_upsample_mode": decoder_upsample_mode,
             "final_activation": final_activation,
             "share_encoder": False,
@@ -941,9 +943,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_scales", type=int, default=4, help="Number of hierarchical scales")
     parser.add_argument("--final_activation", type=str, default="sigmoid", choices=["sigmoid", "tanh", "none"],
                         help="Final activation function")
-    parser.add_argument("--use_prior", action="store_true", help="Use learned prior in latent space")
-    parser.add_argument("--use_encoder_outputs_as_skip", action="store_true",
-                        help="Use encoder outputs as skip connections in decoder")
+    parser.add_argument("--no_instance_norm", action="store_true",
+                        help="disable instance normalization in encoder and decoder")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping (0 to disable)")
     parser.add_argument("--decoder_upsample_mode", type=str, default="trilinear",
                         choices=["trilinear", "transpose", "pixelshuffle"],
@@ -1145,8 +1146,7 @@ if __name__ == "__main__":
         val_patch_size=tuple(args.val_patch_size),
         val_overlap=args.val_overlap,
         final_activation=args.final_activation,
-        use_prior=args.use_prior,
-        use_encoder_outputs_as_skip=args.use_encoder_outputs_as_skip,
+        use_instance_norm=not args.no_instance_norm,
         reconstruct_orientations=not args.no_reconstruct_orientations,
         max_grad_norm=args.max_grad_norm,
         decoder_upsample_mode=args.decoder_upsample_mode,

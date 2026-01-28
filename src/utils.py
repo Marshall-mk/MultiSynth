@@ -744,7 +744,13 @@ def get_image_paths(
 
 def find_latest_checkpoint(model_dir, model_type="uhved"):
     """Find the latest checkpoint in the model directory."""
+    # Match both naming conventions:
+    #   {model_type}_*_epoch_*.pth  (e.g., uhved_orthogonal_epoch_0010.pth)
+    #   {model_type}_epoch_*.pth    (e.g., unet_epoch_0010.pth)
     checkpoints = glob.glob(os.path.join(model_dir, f"{model_type}_*_epoch_*.pth"))
+    checkpoints += glob.glob(os.path.join(model_dir, f"{model_type}_epoch_*.pth"))
+    # Deduplicate (the first pattern may also match the second)
+    checkpoints = list(set(checkpoints))
     if not checkpoints:
         return None
 
@@ -761,7 +767,7 @@ def find_latest_checkpoint(model_dir, model_type="uhved"):
 
 def save_model_checkpoint(filepath, model, optimizer, epoch, loss, val_loss=None,
                           model_type="uhved", model_config=None, scheduler_state_dict=None,
-                          val_metrics=None, training_config=None):
+                          val_metrics=None, training_config=None, global_step=None):
     """
     Save model checkpoint with complete training state.
 
@@ -777,6 +783,7 @@ def save_model_checkpoint(filepath, model, optimizer, epoch, loss, val_loss=None
         scheduler_state_dict: Learning rate scheduler state (optional)
         val_metrics: Dictionary of validation metrics (optional)
         training_config: Full training configuration for reproducibility (optional)
+        global_step: Global training step count (optional)
     """
     checkpoint = {
         'epoch': epoch,
@@ -797,37 +804,29 @@ def save_model_checkpoint(filepath, model, optimizer, epoch, loss, val_loss=None
     if training_config:
         checkpoint['training_config'] = training_config
 
+    if global_step is not None:
+        checkpoint['global_step'] = global_step
+
     torch.save(checkpoint, filepath)
 
 
 def save_training_config(model_dir, args, n_train_samples, n_val_samples, training_stage):
-    """Save training configuration to JSON."""
+    """Save training configuration to JSON. Works for both UHVED and U-Net training."""
     import json
 
     config = {
-        # Training stage and architecture
+        # Training stage
         'training_stage': training_stage,
-        'model_architecture': 'uhved',
-        'num_orientations': 3,  # Fixed: axial, coronal, sagittal
 
         # Dataset info
         'n_train_samples': n_train_samples,
         'n_val_samples': n_val_samples,
 
-        # Training parameters
+        # Training parameters (common to all scripts)
         'epochs': args.epochs,
         'batch_size': args.batch_size,
         'learning_rate': args.learning_rate,
         'seed': args.seed,
-
-        # Model architecture
-        'base_channels': args.base_channels,
-        'num_scales': args.num_scales,
-        'final_activation': args.final_activation,
-        'use_prior': True,
-        'use_encoder_outputs_as_skip': False,
-        'use_instance_norm': not args.no_instance_norm,
-        'decoder_upsample_mode': args.decoder_upsample_mode,
 
         # Output configuration
         'output_shape': args.output_shape,
@@ -837,17 +836,6 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
         'min_resolution': args.min_resolution,
         'max_res_aniso': args.max_res_aniso,
         'randomise_res': not args.no_randomise_res,
-
-        # Loss configuration
-        'recon_loss_type': args.recon_loss_type,
-        'recon_weight': args.recon_weight,
-        'kl_weight': args.kl_weight,
-        'perceptual_weight': args.perceptual_weight,
-        'ssim_weight': args.ssim_weight,
-        'orientation_weight': args.orientation_weight,
-        'use_perceptual': args.use_perceptual,
-        'use_ssim': args.use_ssim,
-        'perceptual_network': args.perceptual_network,
 
         # Artifact probabilities
         'prob_motion': args.prob_motion,
@@ -859,6 +847,11 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
         'orientation_dropout_prob': args.orientation_dropout_prob,
         'min_orientations': args.min_orientations,
         'drop_orientations': args.drop_orientations,
+
+        # Common loss config
+        'perceptual_weight': args.perceptual_weight,
+        'use_perceptual': args.use_perceptual,
+        'perceptual_network': args.perceptual_network,
 
         # Training optimization
         'mixed_precision': args.mixed_precision,
@@ -874,6 +867,41 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
         'val_patch_size': args.val_patch_size,
         'val_overlap': args.val_overlap,
     }
+
+    # UHVED-specific configuration
+    if training_stage == 'uhved':
+        config.update({
+            'model_architecture': 'uhved',
+            'num_orientations': 3,
+            'base_channels': args.base_channels,
+            'num_scales': args.num_scales,
+            'final_activation': args.final_activation,
+            'use_prior': True,
+            'use_encoder_outputs_as_skip': False,
+            'use_instance_norm': not args.no_instance_norm,
+            'decoder_upsample_mode': args.decoder_upsample_mode,
+            'recon_loss_type': args.recon_loss_type,
+            'recon_weight': args.recon_weight,
+            'kl_weight': args.kl_weight,
+            'ssim_weight': args.ssim_weight,
+            'orientation_weight': args.orientation_weight,
+            'use_ssim': args.use_ssim,
+            'is_fake_3d': getattr(args, 'is_fake_3d', False),
+            'reconstruct_orientations': not getattr(args, 'no_reconstruct_orientations', False),
+            'balanced_orientation_combos': getattr(args, 'balanced_orientation_combos', False),
+        })
+
+    # U-Net-specific configuration
+    elif training_stage == 'unet':
+        config.update({
+            'model_architecture': getattr(args, 'model_type', 'segresnet'),
+            'use_stacks': args.use_stacks,
+            'l1_weight': args.l1_weight,
+            'ssim_weight': args.ssim_weight,
+            'weight_decay': args.weight_decay,
+            'early_stopping_patience': args.early_stopping_patience,
+            'upsample_mode': args.upsample_mode,
+        })
 
     config_path = os.path.join(model_dir, 'training_config.json')
     with open(config_path, 'w') as f:

@@ -870,15 +870,17 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
 
     # UHVED-specific configuration
     if training_stage == 'uhved':
+        # Get actual model architecture (uhved or uhved_segres)
+        model_arch = getattr(args, 'model_architecture', 'uhved')
+
+        # Common UHVED parameters
         config.update({
-            'model_architecture': 'uhved',
+            'model_architecture': model_arch,
             'num_orientations': 3,
-            'base_channels': args.base_channels,
             'num_scales': args.num_scales,
             'final_activation': args.final_activation,
             'use_prior': True,
             'use_encoder_outputs_as_skip': False,
-            'use_instance_norm': not args.no_instance_norm,
             'decoder_upsample_mode': args.decoder_upsample_mode,
             'recon_loss_type': args.recon_loss_type,
             'recon_weight': args.recon_weight,
@@ -890,6 +892,20 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples, traini
             'reconstruct_orientations': not getattr(args, 'no_reconstruct_orientations', False),
             'balanced_orientation_combos': getattr(args, 'balanced_orientation_combos', False),
         })
+
+        # Architecture-specific parameters
+        if model_arch == 'uhved':
+            config.update({
+                'base_channels': args.base_channels,
+                'use_instance_norm': not args.no_instance_norm,
+            })
+        elif model_arch == 'uhved_segres':
+            config.update({
+                'init_filters': getattr(args, 'init_filters', 32),
+                'blocks_down': getattr(args, 'blocks_down', [1, 2, 2, 4]),
+                'blocks_up': getattr(args, 'blocks_up', [1, 1, 1]),
+                'num_groups': getattr(args, 'num_groups', 8),
+            })
 
     # U-Net-specific configuration
     elif training_stage == 'unet':

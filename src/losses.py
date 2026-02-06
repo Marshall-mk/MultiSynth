@@ -308,8 +308,8 @@ class UHVEDLoss(nn.Module):
                 - 'alex': AlexNet (default, lightweight LPIPS standard)
                 - 'vgg': VGG network
                 - 'squeeze': SqueezeNet
-                - 'radimagenet': RadImageNet pretrained
-                - 'medicalnet': MedicalNet pretrained
+                - 'radimagenet': RadImageNet ResNet-50 pretrained (maps to radimagenet_resnet50)
+                - 'medicalnet': MedicalNet ResNet-10 pretrained (maps to medicalnet_resnet10_23datasets)
                 - 'resnet50': ResNet-50
             is_fake_3d: Use 2.5D (fake 3D) mode for perceptual loss
                 - False: Full 3D processing (default, more accurate)
@@ -336,14 +336,22 @@ class UHVEDLoss(nn.Module):
         # 3D Perceptual loss
         if use_perceptual:
             try:
+                # Map user-friendly names to full MONAI network names
+                network_mapping = {
+                    'radimagenet': 'radimagenet_resnet50',
+                    'medicalnet': 'medicalnet_resnet10_23datasets',  # Default to ResNet10
+                }
+                monai_network_name = network_mapping.get(perceptual_network, perceptual_network)
+
                 self.perceptual_loss = PerceptualLoss(
                     spatial_dims=3,
-                    network_type=perceptual_network,
+                    network_type=monai_network_name,
                     is_fake_3d=is_fake_3d,
                     pretrained=True
                 )
                 mode_str = "2.5D (fake 3D)" if is_fake_3d else "full 3D"
-                print(f"✓ MONAI Perceptual Loss initialized with network: {perceptual_network} ({mode_str})")
+                actual_name = f"{perceptual_network} ({monai_network_name})" if perceptual_network in network_mapping else perceptual_network
+                print(f"✓ MONAI Perceptual Loss initialized with network: {actual_name} ({mode_str})")
             except ImportError:
                 raise ImportError(
                     "MONAI PerceptualLoss not found. Please install/update MONAI:\n"

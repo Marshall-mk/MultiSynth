@@ -18,4 +18,4 @@ scipy
 matplotlib
 streamlit
 rich
-hd-bet
+gdown

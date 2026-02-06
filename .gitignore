@@ -169,7 +169,8 @@ processed_data/
 outputs/
 results/
 experiments/
-
+unet_*/
+mshved_*/
 # IDE specific files
 .vscode/
 .idea/

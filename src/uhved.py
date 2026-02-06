@@ -491,3 +491,82 @@ def create_uhved(
     cfg.update(kwargs)
 
     return model_class(**cfg)
+
+if __name__ == "__main__":
+    # Debug: Print tensor shapes at each point in the network
+    print("=" * 60)
+    print("U-HVED Shape Analysis")
+    print("=" * 60)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Create model
+    model = create_uhved(config='default').to(device)
+    model.eval()
+
+    # Create dummy inputs: 3 orientations, batch=2, channels=1, spatial=128x128x64
+    batch_size = 2
+    num_orientations = 3
+    spatial_size = (128, 128, 64)
+
+    orientations = [
+        torch.randn(batch_size, 1, *spatial_size).to(device)
+        for _ in range(num_orientations)
+    ]
+
+    print(f"\n[INPUT]")
+    print(f"  Number of orientations: {num_orientations}")
+    for i, ori in enumerate(orientations):
+        print(f"  Orientation {i}: {ori.shape}")
+
+    # Step through the network
+    with torch.no_grad():
+        # 1. Encode
+        print(f"\n[ENCODER OUTPUT]")
+        encoder_outputs = model.encode(orientations)
+        for scale_idx, scale_data in enumerate(encoder_outputs):
+            print(f"  Scale {scale_idx}:")
+            for ori_idx in scale_data['mu']:
+                mu = scale_data['mu'][ori_idx]
+                logvar = scale_data['logvar'][ori_idx]
+                print(f"    Orientation {ori_idx}: mu={mu.shape}, logvar={logvar.shape}")
+            if 'features' in scale_data and scale_data['features']:
+                for ori_idx in scale_data['features']:
+                    feat = scale_data['features'][ori_idx]
+                    print(f"    Orientation {ori_idx} features: {feat.shape}")
+
+        # 2. Fuse
+        print(f"\n[FUSION OUTPUT (Product of Gaussians)]")
+        latent_samples, posteriors = model.fuse(encoder_outputs, deterministic=True)
+        print(f"  Latent samples (per scale):")
+        for scale_idx, sample in enumerate(latent_samples):
+            print(f"    Scale {scale_idx}: {sample.shape}")
+        print(f"  Posteriors (fused mu, logvar per scale):")
+        for scale_idx, (mu, logvar) in enumerate(posteriors):
+            print(f"    Scale {scale_idx}: mu={mu.shape}, logvar={logvar.shape}")
+
+        # 3. Decode
+        print(f"\n[DECODER OUTPUT]")
+        if model.reconstruct_orientations:
+            sr_output, orientation_outputs = model.decode(latent_samples, encoder_outputs)
+            print(f"  SR output: {sr_output.shape}")
+            print(f"  Orientation reconstructions:")
+            for i, ori_out in enumerate(orientation_outputs):
+                print(f"    Orientation {i}: {ori_out.shape}")
+        else:
+            sr_output = model.decode(latent_samples, encoder_outputs)
+            print(f"  SR output: {sr_output.shape}")
+
+        # Full forward pass summary
+        print(f"\n[FULL FORWARD PASS]")
+        outputs = model(orientations)
+        print(f"  sr_output: {outputs['sr_output'].shape}")
+        print(f"  orientation_outputs: {len(outputs['orientation_outputs'])} tensors")
+        if outputs['orientation_outputs']:
+            for i, o in enumerate(outputs['orientation_outputs']):
+                print(f"    [{i}]: {o.shape}")
+        print(f"  posteriors: {len(outputs['posteriors'])} scales")
+        print(f"  latent_samples: {len(outputs['latent_samples'])} scales")
+
+    print("\n" + "=" * 60)
+    print("Done!")
+    print("=" * 60)

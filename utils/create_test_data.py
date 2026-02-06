@@ -234,6 +234,8 @@ def main():
                         help="Disable resolution randomization")
     parser.add_argument("--prob_motion", type=float, default=0.5,
                         help="Probability of motion artifacts")
+    parser.add_argument("--fov_augmentation_prob", type=float, default=0.7,
+                        help="Probability of FOV augmentation")
     parser.add_argument("--prob_spike", type=float, default=0.5,
                         help="Probability of k-space spikes")
     parser.add_argument("--prob_aliasing", type=float, default=0.02,
@@ -336,6 +338,7 @@ def main():
         max_res_aniso=args.max_res_aniso,
         randomise_res=not args.no_randomise_res,
         prob_motion=args.prob_motion,
+        fov_augmentation_prob=args.fov_augmentation_prob,
         prob_spike=args.prob_spike,
         prob_aliasing=args.prob_aliasing,
         prob_bias_field=args.prob_bias_field,
@@ -354,7 +357,7 @@ def main():
         print(f"  Output shape mode: Use input volume shape (default)")
     print(f"  Resolution range: {args.min_resolution} to {args.max_res_aniso}")
     print(f"  Artifact probabilities: motion={args.prob_motion}, spike={args.prob_spike}, "
-          f"aliasing={args.prob_aliasing}, bias={args.prob_bias_field}, noise={args.prob_noise}")
+          f"aliasing={args.prob_aliasing}, bias={args.prob_bias_field}, noise={args.prob_noise}, fov={args.fov_augmentation_prob}")
     print(f"  Upsample mode: {args.upsample_mode}")
     print()
 
@@ -390,7 +393,7 @@ def main():
 
             # Generate LR stacks
             with torch.no_grad():
-                lr_stacks, true_lr_stacks, hr_aug, resolutions, thicknesses, orientation_mask = generator.generate_paired_data(
+                lr_stacks, true_lr_stacks, hr_aug, resolutions, thicknesses, orientation_mask, spatial_masks = generator.generate_paired_data(
                     hr_batch, return_resolution=True, return_intermediate=True
                 )
 

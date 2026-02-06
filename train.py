@@ -32,7 +32,7 @@ from transformers import get_cosine_schedule_with_warmup
 from monai.data import DataLoader
 
 # Import our modules
-from src import UHVED, UHVEDLoss
+from src import UHVED, UHVEDSegRes, UHVEDLoss, create_uhved, create_uhved_segres
 from src.data import HRLRDataGenerator, create_dataset
 from src.utils import (
     save_model_checkpoint,
@@ -44,6 +44,55 @@ from src.utils import (
     print_model_statistics,
     print_gpu_memory_stats,
 )
+
+
+def build_model_config(
+    model_architecture: str,
+    num_orientations: int,
+    num_scales: int,
+    output_shape: tuple,
+    reconstruct_orientations: bool,
+    decoder_upsample_mode: str,
+    final_activation: str,
+    base_channels: int = None,
+    use_instance_norm: bool = None,
+    init_filters: int = None,
+    blocks_down: tuple = None,
+    blocks_up: tuple = None,
+    num_groups: int = None,
+) -> dict:
+    """Build model configuration dictionary for checkpoint saving."""
+    config = {
+        "model_architecture": model_architecture,
+        "num_orientations": num_orientations,
+        "num_scales": num_scales,
+        "output_shape": output_shape,
+        "reconstruct_orientations": reconstruct_orientations,
+        "use_prior": True,
+        "use_encoder_outputs_as_skip": False,
+        "decoder_upsample_mode": decoder_upsample_mode,
+        "final_activation": final_activation,
+        "share_encoder": False,
+        "share_decoder": False,
+        "activation": 'leakyrelu',
+        "in_channels": 1,
+        "out_channels": 1,
+    }
+
+    if model_architecture == "uhved":
+        config.update({
+            "base_channels": base_channels,
+            "use_instance_norm": use_instance_norm,
+        })
+    elif model_architecture == "uhved_segres":
+        config.update({
+            "init_filters": init_filters,
+            "blocks_down": list(blocks_down),
+            "blocks_up": list(blocks_up),
+            "num_groups": num_groups,
+        })
+
+    return config
 
 
 def train_uhved_model(
@@ -67,6 +116,7 @@ def train_uhved_model(
     prob_aliasing: float = 0.1,
     prob_bias_field: float = 0.5,
     prob_noise: float = 0.8,
+    fov_augmentation_prob: float = 0.7,
     apply_intensity_aug: bool = True,
     orientation_dropout_prob: float = 0.0,
     min_orientations: int = 1,
@@ -101,7 +151,12 @@ def train_uhved_model(
     final_activation: str = "sigmoid",
     max_grad_norm: float = 1.0,
     decoder_upsample_mode: str = "trilinear",
-    upsample_mode: str = "nearest",
+    upsample_mode: str = "trilinear",
+    model_architecture: str = "uhved",
+    init_filters: int = 32,
+    blocks_down: list = None,
+    blocks_up: list = None,
+    num_groups: int = 8,
 ):
     """
     Train U-HVED model with orthogonal LR stacks
@@ -127,6 +182,7 @@ def train_uhved_model(
         prob_aliasing: Probability of aliasing artifacts
         prob_bias_field: Probability of bias field
         prob_noise: Probability of noise
+        fov_augmentation_prob: Probability of FOV augmentation
         apply_intensity_aug: Whether to apply intensity augmentation
         orientation_dropout_prob: Probability of applying orientation dropout (0.0-1.0)
         min_orientations: Minimum number of orientations to keep after dropout (1-3)
@@ -228,6 +284,7 @@ def train_uhved_model(
         prob_aliasing=prob_aliasing,
         prob_bias_field=prob_bias_field,
         prob_noise=prob_noise,
+        fov_augmentation_prob=fov_augmentation_prob,
         apply_intensity_aug=apply_intensity_aug,
         clip_to_unit_range=True,
         orientation_dropout_prob=orientation_dropout_prob,
@@ -292,7 +349,11 @@ def train_uhved_model(
     checkpoint_data = None
 
     if checkpoint is None:
-        checkpoint = find_latest_checkpoint(model_dir, model_type="uhved")
+        # Try to find checkpoint for current architecture first, then fallback to generic "uhved"
+        checkpoint = find_latest_checkpoint(model_dir, model_type=model_architecture)
+        if not checkpoint:
+            # Fallback to generic "uhved" for backward compatibility
+            checkpoint = find_latest_checkpoint(model_dir, model_type="uhved")
         if checkpoint and accelerator.is_main_process:
             print(f"Auto-detected checkpoint: {checkpoint}")
 
@@ -321,29 +382,65 @@ def train_uhved_model(
                 f"--no_reconstruct_orientations flag to match checkpoint."
             )
 
+        # Validate architecture compatibility
+        checkpoint_architecture = checkpoint_model_config.get('model_architecture', 'uhved')
+        if checkpoint_architecture != model_architecture:
+            raise ValueError(
+                f"\nCheckpoint architecture mismatch!\n"
+                f"  Checkpoint: {checkpoint_architecture}\n"
+                f"  Current: {model_architecture}\n"
+                f"  Hint: Add --model_architecture {checkpoint_architecture} to match checkpoint."
+            )
+
     # Create U-HVED model
     if accelerator.is_main_process:
         print(f"Creating U-HVED model:")
+        print(f"  - Architecture: {model_architecture}")
         print(f"  - Number of orientations: 3 (orthogonal stacks)")
-        print(f"  - Base channels: {base_channels}")
         print(f"  - Number of scales: {num_scales}")
         print(f"  - Final activation: {final_activation}")
+        if model_architecture == "uhved":
+            print(f"  - Base channels: {base_channels}")
+        elif model_architecture == "uhved_segres":
+            print(f"  - Init filters: {init_filters}")
+            print(f"  - Blocks down: {blocks_down}")
+            print(f"  - Blocks up: {blocks_up}")
+            print(f"  - Num groups: {num_groups}")
 
-    model = UHVED(
-        num_orientations=3,  # Fixed: axial, coronal, sagittal
-        in_channels=1,
-        out_channels=1,
-        base_channels=base_channels,
-        num_scales=num_scales,
-        share_encoder=False,  # Independent encoders for each orientation
-        share_decoder=False,
-        use_prior=True,
-        use_encoder_outputs_as_skip=False,  # Use encoder features as skip connections
-        reconstruct_orientations=reconstruct_orientations,  # Control orientation reconstruction for ablations
-        use_instance_norm=use_instance_norm,
-        final_activation=final_activation,
-        upsample_mode=decoder_upsample_mode,
-    )
+    # Common parameters for both architectures
+    common_params = {
+        'num_orientations': 3,
+        'in_channels': 1,
+        'out_channels': 1,
+        'num_scales': num_scales,
+        'share_encoder': False,
+        'share_decoder': False,
+        'use_prior': True,
+        'use_encoder_outputs_as_skip': False,
+        'reconstruct_orientations': reconstruct_orientations,
+        'final_activation': final_activation,
+        'upsample_mode': decoder_upsample_mode,
+    }
+
+    # Create model based on architecture
+    if model_architecture == "uhved":
+        model = create_uhved(
+            config='default',
+            base_channels=base_channels,
+            use_instance_norm=use_instance_norm,
+            **common_params
+        )
+    elif model_architecture == "uhved_segres":
+        model = create_uhved_segres(
+            config='default',
+            init_filters=init_filters,
+            blocks_down=tuple(blocks_down),
+            blocks_up=tuple(blocks_up),
+            num_groups=num_groups,
+            **common_params
+        )
+    else:
+        raise ValueError(f"Unknown model architecture: {model_architecture}")
 
     # Load checkpoint weights if available
     if checkpoint_data is not None:
@@ -432,9 +529,8 @@ def train_uhved_model(
     # Initialize Weights & Biases if enabled
     if use_wandb and accelerator.is_main_process:
         wandb_config = {
-            "model": "uhved",
+            "model": model_architecture,
             "num_orientations": 3,
-            "base_channels": base_channels,
             "num_scales": num_scales,
             "epochs": epochs,
             "batch_size": batch_size,
@@ -449,6 +545,16 @@ def train_uhved_model(
             "n_train_samples": len(hr_image_paths),
             "n_val_samples": len(val_image_paths) if val_image_paths else 0,
         }
+
+        # Add architecture-specific fields
+        if model_architecture == "uhved":
+            wandb_config["base_channels"] = base_channels
+            wandb_config["use_instance_norm"] = use_instance_norm
+        elif model_architecture == "uhved_segres":
+            wandb_config["init_filters"] = init_filters
+            wandb_config["blocks_down"] = blocks_down
+            wandb_config["blocks_up"] = blocks_up
+            wandb_config["num_groups"] = num_groups
 
         wandb.init(
             project=wandb_project,
@@ -505,7 +611,7 @@ def train_uhved_model(
 
         for batch_idx, batch_data in enumerate(pbar):
             # Unpack batch: (lr_stacks_list, hr, resolutions_list, thicknesses_list, orientation_mask)
-            lr_stacks_list, target_img, resolutions_list, thicknesses_list, orientation_mask = batch_data
+            lr_stacks_list, target_img, resolutions_list, thicknesses_list, orientation_mask, spatial_masks = batch_data
             orientations = lr_stacks_list
 
             # Ensure consistent dtype
@@ -593,7 +699,7 @@ def train_uhved_model(
 
             with torch.no_grad():
                 for val_batch_data in val_dataloader:
-                    lr_stacks_list, target_img, _, _, orientation_mask = val_batch_data
+                    lr_stacks_list, target_img, _, _, orientation_mask, spatial_masks = val_batch_data
                     orientations = [m.float() for m in lr_stacks_list]
                     target_img = target_img.float()
 
@@ -738,26 +844,23 @@ def train_uhved_model(
             best_val_loss = val_loss
             accelerator.wait_for_everyone()
             if accelerator.is_main_process:
-                best_model_path = os.path.join(model_dir, "uhved_orthogonal_best.pth")
+                best_model_path = os.path.join(model_dir, f"{model_architecture}_orthogonal_best.pth")
 
-                model_config = {
-                    "model_architecture": "uhved",
-                    "num_orientations": 3,
-                    "base_channels": base_channels,
-                    "num_scales": num_scales,
-                    "output_shape": output_shape,
-                    "reconstruct_orientations": reconstruct_orientations,
-                    "use_prior": True,
-                    "use_encoder_outputs_as_skip": False,
-                    "use_instance_norm": use_instance_norm,
-                    "decoder_upsample_mode": decoder_upsample_mode,
-                    "final_activation": final_activation,
-                    "share_encoder": False,
-                    "share_decoder": False,
-                    "activation": 'leakyrelu',
-                    "in_channels": 1,
-                    "out_channels": 1,
-                }
+                model_config = build_model_config(
+                    model_architecture=model_architecture,
+                    num_orientations=3,
+                    num_scales=num_scales,
+                    output_shape=output_shape,
+                    reconstruct_orientations=reconstruct_orientations,
+                    decoder_upsample_mode=decoder_upsample_mode,
+                    final_activation=final_activation,
+                    base_channels=base_channels,
+                    use_instance_norm=use_instance_norm,
+                    init_filters=init_filters,
+                    blocks_down=tuple(blocks_down) if blocks_down else None,
+                    blocks_up=tuple(blocks_up) if blocks_up else None,
+                    num_groups=num_groups,
+                )
 
                 training_config = {
                     "learning_rate": learning_rate,
@@ -792,27 +895,24 @@ def train_uhved_model(
             accelerator.wait_for_everyone()
             if accelerator.is_main_process:
                 checkpoint_path = os.path.join(
-                    model_dir, f"uhved_orthogonal_epoch_{epoch + 1:04d}.pth"
+                    model_dir, f"{model_architecture}_orthogonal_epoch_{epoch + 1:04d}.pth"
                 )
 
-                model_config = {
-                    "model_architecture": "uhved",
-                    "num_orientations": 3,
-                    "base_channels": base_channels,
-                    "num_scales": num_scales,
-                    "output_shape": output_shape,
-                    "reconstruct_orientations": reconstruct_orientations,
-                    "use_prior": True,
-                    "use_encoder_outputs_as_skip": False,
-                    "use_instance_norm": use_instance_norm,
-                    "decoder_upsample_mode": decoder_upsample_mode,
-                    "final_activation": final_activation,
-                    "share_encoder": False,
-                    "share_decoder": False,
-                    "activation": 'leakyrelu',
-                    "in_channels": 1,
-                    "out_channels": 1,
-                }
+                model_config = build_model_config(
+                    model_architecture=model_architecture,
+                    num_orientations=3,
+                    num_scales=num_scales,
+                    output_shape=output_shape,
+                    reconstruct_orientations=reconstruct_orientations,
+                    decoder_upsample_mode=decoder_upsample_mode,
+                    final_activation=final_activation,
+                    base_channels=base_channels,
+                    use_instance_norm=use_instance_norm,
+                    init_filters=init_filters,
+                    blocks_down=tuple(blocks_down) if blocks_down else None,
+                    blocks_up=tuple(blocks_up) if blocks_up else None,
+                    num_groups=num_groups,
+                )
 
                 training_config = {
                     "learning_rate": learning_rate,
@@ -849,25 +949,22 @@ def train_uhved_model(
     # Save final model
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        final_path = os.path.join(model_dir, "uhved_orthogonal_final.pth")
-        model_config = {
-            "model_architecture": "uhved",
-            "num_orientations": 3,
-            "base_channels": base_channels,
-            "num_scales": num_scales,
-            "output_shape": output_shape,
-            "reconstruct_orientations": reconstruct_orientations,
-            "use_prior": True,
-            "use_encoder_outputs_as_skip": False,
-            "use_instance_norm": use_instance_norm,
-            "decoder_upsample_mode": decoder_upsample_mode,
-            "final_activation": final_activation,
-            "share_encoder": False,
-            "share_decoder": False,
-            "activation": 'leakyrelu',
-            "in_channels": 1,
-            "out_channels": 1,
-        }
+        final_path = os.path.join(model_dir, f"{model_architecture}_orthogonal_final.pth")
+        model_config = build_model_config(
+            model_architecture=model_architecture,
+            num_orientations=3,
+            num_scales=num_scales,
+            output_shape=output_shape,
+            reconstruct_orientations=reconstruct_orientations,
+            decoder_upsample_mode=decoder_upsample_mode,
+            final_activation=final_activation,
+            base_channels=base_channels,
+            use_instance_norm=use_instance_norm,
+            init_filters=init_filters,
+            blocks_down=tuple(blocks_down) if blocks_down else None,
+            blocks_up=tuple(blocks_up) if blocks_up else None,
+            num_groups=num_groups,
+        )
 
         training_config = {
             "learning_rate": learning_rate,
@@ -951,6 +1048,21 @@ if __name__ == "__main__":
                         help="Decoder upsampling strategy: trilinear (interpolation+conv), "
                              "transpose (transposed conv), or pixelshuffle (sub-pixel conv)")
 
+    # Model architecture selection
+    parser.add_argument("--model_architecture", type=str, default="uhved",
+                        choices=["uhved", "uhved_segres"],
+                        help="Model architecture type (default: uhved)")
+
+    # SegResNet-specific parameters (only used when model_architecture='uhved_segres')
+    parser.add_argument("--init_filters", type=int, default=32,
+                        help="[SegRes only] Initial filter count (default: 32)")
+    parser.add_argument("--blocks_down", type=int, nargs='+', default=[1, 2, 2, 4],
+                        help="[SegRes only] Residual blocks per encoder scale")
+    parser.add_argument("--blocks_up", type=int, nargs='+', default=[1, 1, 1],
+                        help="[SegRes only] Residual blocks per decoder scale")
+    parser.add_argument("--num_groups", type=int, default=8,
+                        help="[SegRes only] Number of groups for GroupNorm (default: 8)")
+
     # Training parameters
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
@@ -969,7 +1081,9 @@ if __name__ == "__main__":
     parser.add_argument("--use_ssim", action="store_true", help="Use SSIM loss")
     parser.add_argument("--perceptual_network", type=str, default="alex",
                         choices=["alex", "vgg", "squeeze", "radimagenet", "medicalnet", "resnet50"],
-                        help="Perceptual loss network (MONAI) - default: alex for fast LPIPS")
+                        help="Perceptual loss network (MONAI). Options: alex (default, fast LPIPS), "
+                             "vgg, squeeze, radimagenet (RadImageNet ResNet-50), "
+                             "medicalnet (MedicalNet ResNet-10), resnet50")
     parser.add_argument("--is_fake_3d", action="store_true",
                         help="Use 2.5D (fake 3D) mode for perceptual loss (faster, lower memory)")
 
@@ -983,6 +1097,7 @@ if __name__ == "__main__":
     parser.add_argument("--prob_aliasing", type=float, default=0.02, help="Probability of aliasing")
     parser.add_argument("--prob_bias_field", type=float, default=0.5, help="Probability of bias field")
     parser.add_argument("--prob_noise", type=float, default=0.8, help="Probability of noise")
+    parser.add_argument("--fov_augmentation_prob", type=float, default=0.7, help="Probability of FOV augmentation")
     parser.add_argument("--no_intensity_aug", action="store_true", help="Disable intensity augmentation")
 
     # orientation dropout (for robust training with missing views)
@@ -1007,7 +1122,7 @@ if __name__ == "__main__":
                         help="Disable orientation reconstruction (SR decoder only, for ablation studies)")
 
     # Data interpolation
-    parser.add_argument("--upsample_mode", type=str, default="nearest",
+    parser.add_argument("--upsample_mode", type=str, default="trilinear",
                         choices=["nearest", "trilinear", "nearest-exact"],
                         help="Interpolation mode for FFT upsample recovery (default: nearest)")
 
@@ -1094,6 +1209,10 @@ if __name__ == "__main__":
         training_stage="uhved",
     )
 
+    # Prepare architecture-specific parameters
+    blocks_down = args.blocks_down if hasattr(args, 'blocks_down') else [1, 2, 2, 4]
+    blocks_up = args.blocks_up if hasattr(args, 'blocks_up') else [1, 1, 1]
+
     # Train model
     train_uhved_model(
         hr_image_paths=hr_image_paths,
@@ -1116,6 +1235,7 @@ if __name__ == "__main__":
         prob_aliasing=args.prob_aliasing,
         prob_bias_field=args.prob_bias_field,
         prob_noise=args.prob_noise,
+        fov_augmentation_prob=args.fov_augmentation_prob,
         apply_intensity_aug=not args.no_intensity_aug,
         orientation_dropout_prob=args.orientation_dropout_prob,
         min_orientations=args.min_orientations,
@@ -1151,4 +1271,9 @@ if __name__ == "__main__":
         max_grad_norm=args.max_grad_norm,
         decoder_upsample_mode=args.decoder_upsample_mode,
         upsample_mode=args.upsample_mode,
+        model_architecture=args.model_architecture,
+        init_filters=args.init_filters,
+        blocks_down=blocks_down,
+        blocks_up=blocks_up,
+        num_groups=args.num_groups,
     )

@@ -816,6 +816,280 @@ class MRIArtifactSimulator(torch.nn.Module):
             return final_output
 
 
+class FOVSliceDrop(nn.Module):
+    """
+    Simulates incomplete FOV by dropping slices from the through-plane axis.
+    
+    This correctly mimics real clinical scenarios where:
+    - Axial stacks may miss top (vertex) or bottom (skull base) slices
+    - Coronal stacks may miss anterior or posterior slices
+    - Sagittal stacks may miss lateral slices
+    
+    IMPORTANT: This should be applied to the UPSAMPLED LR stacks.
+    The operation simply zeros out slices - no resizing, no interpolation,
+    no distortion to the remaining anatomy.
+    
+    Args:
+        prob: Probability of applying FOV drop to each orientation
+        min_keep_fraction: Minimum fraction of slices to keep (e.g., 0.5 = keep at least 50%)
+        max_keep_fraction: Maximum fraction to keep (e.g., 0.95 = keep at most 95%)
+    """
+    
+    def __init__(
+        self,
+        prob: float = 0.4,
+        min_keep_fraction: float = 0.5,
+        max_keep_fraction: float = 0.95,
+        force_both_sides: bool = False,
+    ):
+        super().__init__()
+        self.prob = prob
+        self.min_keep_fraction = min_keep_fraction
+        self.max_keep_fraction = max_keep_fraction
+        self.force_both_sides = force_both_sides
+        
+        # Map orientation index to through-plane axis
+        # Axial (0) → W axis (S direction)
+        # Coronal (1) → H axis (A direction)
+        # Sagittal (2) → D axis (R direction)
+        self.orientation_to_axis = {0: 4, 1: 3, 2: 2}  # In (B, C, D, H, W) format
+    
+    def forward(
+        self,
+        image: torch.Tensor,
+        orientation_idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply FOV slice dropping.
+        
+        Args:
+            image: Input volume (B, C, D, H, W) - the upsampled LR stack
+            orientation_idx: 0=Axial, 1=Coronal, 2=Sagittal
+        
+        Returns:
+            cropped_image: Image with some slices zeroed out (same shape as input)
+            spatial_mask: Binary mask (B, 1, D, H, W) indicating valid slices (1=valid, 0=dropped)
+        """
+        B, C, D, H, W = image.shape
+        device = image.device
+        
+        # Initialize output and mask
+        output = image.clone()
+        spatial_mask = torch.ones(B, 1, D, H, W, device=device)
+        
+        # Get the through-plane axis for this orientation
+        axis = self.orientation_to_axis[orientation_idx]
+        axis_size = image.shape[axis]
+        
+        for b in range(B):
+            # Decide whether to apply cropping to this sample
+            if torch.rand(1).item() > self.prob:
+                continue
+            
+            # Sample how many slices to keep
+            keep_fraction = (
+                torch.rand(1).item() * (self.max_keep_fraction - self.min_keep_fraction) 
+                + self.min_keep_fraction
+            )
+            n_keep = max(1, int(axis_size * keep_fraction))
+            n_drop = axis_size - n_keep
+            
+            if n_drop == 0:
+                continue
+            
+            # Decide which end to drop from (or both)
+            if self.force_both_sides:
+                drop_mode = 2  # Always both sides
+            else:
+                drop_mode = torch.randint(0, 3, (1,)).item()  # 0=start, 1=end, 2=both
+            
+            if drop_mode == 0:
+                # Drop from start (e.g., bottom of head for axial)
+                drop_start, drop_end = 0, n_drop
+            elif drop_mode == 1:
+                # Drop from end (e.g., top of head for axial)
+                drop_start, drop_end = axis_size - n_drop, axis_size
+            else:
+                # Drop from both ends
+                drop_each = n_drop // 2
+                drop_start_left, drop_end_left = 0, drop_each
+                drop_start_right = axis_size - (n_drop - drop_each)
+                drop_end_right = axis_size
+            
+            # Create slice objects for zeroing
+            # This is cleaner than creating full masks
+            if axis == 2:  # D axis
+                if drop_mode == 2:
+                    output[b, :, :drop_each, :, :] = 0
+                    output[b, :, drop_start_right:, :, :] = 0
+                    spatial_mask[b, :, :drop_each, :, :] = 0
+                    spatial_mask[b, :, drop_start_right:, :, :] = 0
+                else:
+                    output[b, :, drop_start:drop_end, :, :] = 0
+                    spatial_mask[b, :, drop_start:drop_end, :, :] = 0
+                    
+            elif axis == 3:  # H axis
+                if drop_mode == 2:
+                    output[b, :, :, :drop_each, :] = 0
+                    output[b, :, :, drop_start_right:, :] = 0
+                    spatial_mask[b, :, :, :drop_each, :] = 0
+                    spatial_mask[b, :, :, drop_start_right:, :] = 0
+                else:
+                    output[b, :, :, drop_start:drop_end, :] = 0
+                    spatial_mask[b, :, :, drop_start:drop_end, :] = 0
+                    
+            elif axis == 4:  # W axis
+                if drop_mode == 2:
+                    output[b, :, :, :, :drop_each] = 0
+                    output[b, :, :, :, drop_start_right:] = 0
+                    spatial_mask[b, :, :, :, :drop_each] = 0
+                    spatial_mask[b, :, :, :, drop_start_right:] = 0
+                else:
+                    output[b, :, :, :, drop_start:drop_end] = 0
+                    spatial_mask[b, :, :, :, drop_start:drop_end] = 0
+        
+        return output, spatial_mask
+
+
+class MultiOrientationFOVDrop(nn.Module):
+    """
+    Applies FOV slice dropping to multiple orientation stacks.
+    
+    Ensures that not ALL orientations lose the same region - this would
+    make reconstruction impossible. At least one orientation should
+    cover each anatomical region.
+    
+    Args:
+        prob_per_orientation: Probability of dropping slices for each orientation
+        min_keep_fraction: Minimum fraction of slices to keep
+        max_keep_fraction: Maximum fraction of slices to keep
+        ensure_coverage: If True, ensures complementary coverage (at least one
+                        orientation covers each region)
+    """
+    
+    def __init__(
+        self,
+        prob_per_orientation: float = 0.4,
+        min_keep_fraction: float = 0.5,
+        max_keep_fraction: float = 0.95,
+        ensure_coverage: bool = True,
+        force_both_sides: bool = False,
+    ):
+        super().__init__()
+        self.prob = prob_per_orientation
+        self.min_keep = min_keep_fraction
+        self.max_keep = max_keep_fraction
+        self.ensure_coverage = ensure_coverage
+        self.force_both_sides = force_both_sides
+        
+        self.dropper = FOVSliceDrop(
+            prob=1.0,  # We control probability at this level
+            min_keep_fraction=min_keep_fraction,
+            max_keep_fraction=max_keep_fraction,
+            force_both_sides=force_both_sides
+        )
+    
+    def forward(
+        self,
+        lr_stacks: List[torch.Tensor],
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Apply FOV dropping to a list of orientation stacks.
+        
+        Args:
+            lr_stacks: List of 3 tensors [axial, coronal, sagittal], each (B, C, D, H, W)
+        
+        Returns:
+            dropped_stacks: List of 3 tensors with FOV dropping applied
+            spatial_masks: List of 3 mask tensors (B, 1, D, H, W)
+        """
+        B = lr_stacks[0].shape[0]
+        device = lr_stacks[0].device
+        
+        dropped_stacks = []
+        spatial_masks = []
+        
+        # Decide which orientations to drop FOR EACH BATCH ELEMENT
+        for b in range(B):
+            # Sample which orientations get dropped for this sample
+            drop_decisions = [torch.rand(1).item() < self.prob for _ in range(3)]
+            
+            # If ensure_coverage and all would be dropped, keep one
+            if self.ensure_coverage and all(drop_decisions):
+                # Keep one random orientation fully intact
+                keep_idx = torch.randint(0, 3, (1,)).item()
+                drop_decisions[keep_idx] = False
+        
+            # Store decisions for this batch element
+            if b == 0:
+                batch_drop_decisions = [drop_decisions]
+            else:
+                batch_drop_decisions.append(drop_decisions)
+        
+        # Apply dropping per orientation
+        for orient_idx in range(3):
+            stack = lr_stacks[orient_idx].clone()
+            B, C, D, H, W = stack.shape
+            mask = torch.ones(B, 1, D, H, W, device=device)
+            
+            for b in range(B):
+                if batch_drop_decisions[b][orient_idx]:
+                    # Apply dropping to this sample
+                    single_stack = stack[b:b+1]
+                    dropped, single_mask = self.dropper(single_stack, orient_idx)
+                    stack[b:b+1] = dropped
+                    mask[b:b+1] = single_mask
+            
+            dropped_stacks.append(stack)
+            spatial_masks.append(mask)
+        
+        return dropped_stacks, spatial_masks
+
+
+def apply_fov_augmentation(
+    lr_stacks: List[torch.Tensor],
+    prob: float = 0.4,
+    min_keep: float = 0.5,
+    max_keep: float = 0.95,
+    ensure_coverage: bool = True,
+    force_both_sides: bool = False,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """
+    Convenience function to apply FOV augmentation to LR stacks.
+    
+    Args:
+        lr_stacks: List of [axial, coronal, sagittal] tensors
+        prob: Probability of dropping slices per orientation
+        min_keep: Minimum fraction of slices to keep
+        max_keep: Maximum fraction of slices to keep
+    
+    Returns:
+        augmented_stacks: Stacks with FOV dropping
+        spatial_masks: Corresponding validity masks
+    
+    Example usage in HRLRDataGenerator.generate_paired_data():
+        
+        # After generating lr_stacks...
+        if self.fov_drop_prob > 0:
+            lr_stacks, spatial_masks = apply_fov_augmentation(
+                lr_stacks, 
+                prob=self.fov_drop_prob,
+                min_keep=0.5,
+                max_keep=0.95
+            )
+        else:
+            spatial_masks = [torch.ones_like(s[:, :1]) for s in lr_stacks]
+    """
+    augmenter = MultiOrientationFOVDrop(
+        prob_per_orientation=prob,
+        min_keep_fraction=min_keep,
+        max_keep_fraction=max_keep,
+        ensure_coverage=ensure_coverage,
+        force_both_sides=force_both_sides
+    )
+    return augmenter(lr_stacks)
+
+
 class HRLRDataGenerator:
     """
     Domain randomization pipeline using frequency-domain downsampling.
@@ -853,6 +1127,7 @@ class HRLRDataGenerator:
         prob_aliasing: float = 0.1,
         prob_bias_field: float = 0.5,
         prob_noise: float = 0.8,
+        fov_augmentation_prob: float = 0.7,
         # Resolution simulation
         min_resolution: list = [1.0, 1.0, 1.0],
         max_res_aniso: list = [9.0, 9.0, 9.0],
@@ -878,6 +1153,7 @@ class HRLRDataGenerator:
         self.clip_to_unit_range = clip_to_unit_range
 
         self.prob_bias_field = prob_bias_field
+        self.fov_augmentation_prob = fov_augmentation_prob
         self.upsample_mode = upsample_mode
         self.preserve_input_shape = preserve_input_shape  
         self.return_intermediate = return_intermediate
@@ -1274,13 +1550,29 @@ class HRLRDataGenerator:
         # This mask is passed to the fusion mechanism, which handles the dropout
         # by excluding masked-out orientations from the Product of Gaussians fusion
         orientation_mask = self._create_orientation_mask(batch_size, device)
+        
+        if self.fov_augmentation_prob > 0:
+            lr_stacks, spatial_masks = apply_fov_augmentation(
+                lr_stacks,
+                prob=self.fov_augmentation_prob,
+                min_keep=0.40,
+                max_keep=0.70,
+                ensure_coverage=False,
+                force_both_sides=True,
+            )
+        else:
+            # Full coverage masks
+            spatial_masks = [
+                torch.ones(batch_size, 1, *lr_stacks[0].shape[-3:], device=device)
+                for _ in range(3)
+        ]
 
         if return_resolution and return_intermediate:
-            return lr_stacks, true_lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask
+            return lr_stacks, true_lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask, spatial_masks
         elif return_resolution:    
-            return lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask
+            return lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask, spatial_masks
         else:
-            return lr_stacks, hr_augmented, orientation_mask
+            return lr_stacks, hr_augmented, orientation_mask, spatial_masks
 
 
 
@@ -1377,7 +1669,7 @@ class GeneratorDataset(torch.utils.data.Dataset):
         )
 
         if self.return_resolution:
-            lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask = result
+            lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask, spatial_masks = result
             if self.balanced_orientation_combos:
                 orientation_mask = self._orientation_combo_schedule[idx]
             # lr_stacks is a list of 3 tensors, each (1, C, D, H, W)
@@ -1387,17 +1679,19 @@ class GeneratorDataset(torch.utils.data.Dataset):
                 hr_augmented.squeeze(0),  # HR ground truth
                 [res.squeeze(0) for res in resolutions],  # List of 3 resolution configs
                 [thick.squeeze(0) for thick in thicknesses],  # List of 3 thickness configs
-                orientation_mask.squeeze(0)  # Orientation mask (3,)
+                orientation_mask.squeeze(0),  # Orientation mask (3,)
+                [mask.squeeze(0) for mask in spatial_masks]  # List of 3 spatial masks
             )
         else:
-            lr_stacks, hr_augmented, orientation_mask = result
+            lr_stacks, hr_augmented, orientation_mask, spatial_masks = result
             if self.balanced_orientation_combos:
                 orientation_mask = self._orientation_combo_schedule[idx]
             # Return the three LR stacks as a list
             return (
                 [stack.squeeze(0) for stack in lr_stacks],
                 hr_augmented.squeeze(0),
-                orientation_mask.squeeze(0)
+                orientation_mask.squeeze(0),
+                [mask.squeeze(0) for mask in spatial_masks]  # List of 3 spatial masks
             )
 
 
